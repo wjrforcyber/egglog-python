@@ -54,6 +54,124 @@ struct Enode {
     head: f64,
 }
 
+#[derive(Clone, Debug)]
+struct SccProfile {
+    num_classes: usize,
+    num_sccs: usize,
+    singleton_acyclic_nodes: usize,
+    self_loop_nodes: usize,
+    multi_node_nodes: usize,
+    max_size: usize,
+    mean_size: f64,
+    /// Population variance of SCC sizes (divide by k).
+    var_size: f64,
+    median_size: f64,
+    /// SCC size -> number of SCCs of that size.
+    histogram: Vec<(usize, usize)>,
+}
+
+impl SccProfile {
+    /// Purely observational statistics over the computed SCCs; reads `sccs`
+    /// and `adj` and influences nothing downstream.
+    fn compute(sccs: &[Vec<u32>], adj: &[Vec<u32>]) -> Self {
+        let num_classes: usize = sccs.iter().map(|c| c.len()).sum();
+        let num_sccs = sccs.len();
+        let mut sizes: Vec<usize> = Vec::with_capacity(num_sccs);
+        let mut singleton_acyclic_nodes = 0usize;
+        let mut self_loop_nodes = 0usize;
+        let mut multi_node_nodes = 0usize;
+        let mut histogram: HashMap<usize, usize> = HashMap::default();
+        for comp in sccs {
+            let size = comp.len();
+            sizes.push(size);
+            *histogram.entry(size).or_insert(0) += 1;
+            if size == 1 {
+                let v = comp[0] as usize;
+                if adj[v].iter().any(|&c| c == comp[0]) {
+                    self_loop_nodes += 1;
+                } else {
+                    singleton_acyclic_nodes += 1;
+                }
+            } else {
+                multi_node_nodes += size;
+            }
+        }
+        sizes.sort_unstable();
+        let max_size = sizes.last().copied().unwrap_or(0);
+        let mean_size = if num_sccs == 0 {
+            0.0
+        } else {
+            num_classes as f64 / num_sccs as f64
+        };
+        let var_size = if num_sccs == 0 {
+            0.0
+        } else {
+            sizes
+                .iter()
+                .map(|&s| {
+                    let d = s as f64 - mean_size;
+                    d * d
+                })
+                .sum::<f64>()
+                / num_sccs as f64
+        };
+        let median_size = if num_sccs == 0 {
+            0.0
+        } else if num_sccs % 2 == 1 {
+            sizes[num_sccs / 2] as f64
+        } else {
+            (sizes[num_sccs / 2 - 1] + sizes[num_sccs / 2]) as f64 / 2.0
+        };
+        let mut histogram: Vec<(usize, usize)> = histogram.into_iter().collect();
+        histogram.sort_unstable_by_key(|(s, _)| *s);
+        SccProfile {
+            num_classes,
+            num_sccs,
+            singleton_acyclic_nodes,
+            self_loop_nodes,
+            multi_node_nodes,
+            max_size,
+            mean_size,
+            var_size,
+            median_size,
+            histogram,
+        }
+    }
+
+    fn to_py_dict(&self, py: Python<'_>) -> PyObject {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("num_classes", self.num_classes).unwrap();
+        d.set_item("num_sccs", self.num_sccs).unwrap();
+        d.set_item("singleton_acyclic_nodes", self.singleton_acyclic_nodes).unwrap();
+        d.set_item("self_loop_nodes", self.self_loop_nodes).unwrap();
+        d.set_item("multi_node_nodes", self.multi_node_nodes).unwrap();
+        let cyclic = self.self_loop_nodes + self.multi_node_nodes;
+        d.set_item("cyclic_nodes", cyclic).unwrap();
+        d.set_item("singleton_acyclic_pct", pct(self.singleton_acyclic_nodes, self.num_classes)).unwrap();
+        d.set_item("self_loop_pct", pct(self.self_loop_nodes, self.num_classes)).unwrap();
+        d.set_item("multi_node_pct", pct(self.multi_node_nodes, self.num_classes)).unwrap();
+        d.set_item("cyclic_pct", pct(cyclic, self.num_classes)).unwrap();
+        d.set_item("max_size", self.max_size).unwrap();
+        d.set_item("mean_size", self.mean_size).unwrap();
+        d.set_item("var_size", self.var_size).unwrap();
+        d.set_item("median_size", self.median_size).unwrap();
+        let hist = pyo3::types::PyDict::new(py);
+        for (s, c) in &self.histogram {
+            hist.set_item(s, c).unwrap();
+        }
+        d.set_item("size_histogram", hist).unwrap();
+        d.into_any().unbind()
+    }
+}
+
+fn pct(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        100.0 * part as f64 / total as f64
+    }
+}
+
 #[pyclass(unsendable)]
 pub struct DagExtractor {
     funcs: Vec<FuncTab>,
@@ -64,6 +182,7 @@ pub struct DagExtractor {
     /// Persistent reconstruction memo (class idx -> TermId), shared by all
     /// `extract_best` calls on this extractor (the TermDag is shared too).
     memo: HashMap<u32, TermId>,
+    scc_profile: Option<SccProfile>,
 }
 
 fn fnv_hash(bytes: &[u8], vals: &[EggValue]) -> u64 {
@@ -92,12 +211,19 @@ impl DagExtractor {
     ///                    constructors not listed are ignored (whitelist)
     /// * `fold`        - "sum": head + sum(children)
     ///                    "max": head + max(positive children | 0) + eps*sum(children)
-    /// * `noise_scale` - scale of the deterministic tie-break noise
+    /// * `noise_scale`   - scale of the deterministic tie-break noise
+    /// * `profile_sccs`  - when true, compute (and expose via the
+    ///                      `scc_profile` getter) statistics about the SCC
+    ///                      condensation: node coverage by component kind,
+    ///                      size mean/variance/median/max and a size
+    ///                      histogram.  Purely observational: the DP, costs
+    ///                      and extracted terms are identical whether or not
+    ///                      this is enabled (default false).
     ///
     /// Mirrors eggverse's Python cost models: a head cost of exactly 0 makes
     /// the enode cost 0 regardless of children (constants / variables).
     #[new]
-    #[pyo3(signature = (egraph, sort, head_costs, fold="sum", eps=0.0, noise_scale=1e-7))]
+    #[pyo3(signature = (egraph, sort, head_costs, fold="sum", eps=0.0, noise_scale=1e-7, profile_sccs=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         egraph: &EGraph,
@@ -106,6 +232,7 @@ impl DagExtractor {
         fold: &str,
         eps: f64,
         noise_scale: f64,
+        profile_sccs: bool,
     ) -> PyResult<Self> {
         let eg = &egraph.egraph;
         let root = eg
@@ -355,6 +482,13 @@ impl DagExtractor {
             }
         }
 
+        // ---- optional SCC profiling (purely observational) ----
+        let scc_profile = if profile_sccs {
+            Some(SccProfile::compute(&sccs, &adj))
+        } else {
+            None
+        };
+
         Ok(DagExtractor {
             funcs,
             enodes,
@@ -362,6 +496,7 @@ impl DagExtractor {
             costs,
             best,
             memo: HashMap::default(),
+            scc_profile,
         })
     }
 
@@ -402,6 +537,13 @@ impl DagExtractor {
     #[getter]
     fn num_enodes(&self) -> usize {
         self.enodes.len()
+    }
+
+    /// SCC condensation statistics, or None when the extractor was built
+    /// without `profile_sccs=True`.
+    #[getter]
+    fn scc_profile<'py>(&self, py: Python<'py>) -> Option<PyObject> {
+        self.scc_profile.as_ref().map(|p| p.to_py_dict(py))
     }
 }
 
