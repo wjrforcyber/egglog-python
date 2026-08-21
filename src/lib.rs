@@ -1,4 +1,5 @@
 mod conversions;
+mod dag_extract;
 mod egraph;
 mod error;
 mod extract;
@@ -51,6 +52,7 @@ fn bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::conversions::Function>()?;
     m.add_class::<crate::extract::Extractor>()?;
     m.add_class::<crate::extract::CostModel>()?;
+    m.add_class::<crate::dag_extract::DagExtractor>()?;
     m.add_class::<crate::freeze::FrozenRow>()?;
     m.add_class::<crate::freeze::FrozenFunction>()?;
     m.add_class::<crate::freeze::FrozenEGraph>()?;
