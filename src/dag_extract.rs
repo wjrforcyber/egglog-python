@@ -202,6 +202,24 @@ fn fnv_hash(bytes: &[u8], vals: &[EggValue]) -> u64 {
     h
 }
 
+const FNV_OFF: u64 = 0xcbf29ce484222325;
+
+fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn fnv_mix_u64(mut h: u64, w: u64) -> u64 {
+    for b in w.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 #[pymethods]
 impl DagExtractor {
     /// Build the extractor, running the SCC condensation + levelized DP.
@@ -402,8 +420,26 @@ impl DagExtractor {
         // ---- levelized DP over SCCs (children-first order) ----
         let mut costs: Vec<f64> = vec![f64::INFINITY; n];
         let mut best: Vec<Option<usize>> = vec![None; n];
+        // E4-determinism: bottom-up STRUCTURAL hash per class.  Tie-breaks use
+        // this instead of raw Value bits / enode ids, so equal-cost picks are
+        // stable even if e-class numbering or intern order shifts per process.
+        let mut sh: Vec<u64> = vec![0; n];
 
-        let enode_cost = |e: &Enode, costs: &Vec<f64>| -> Option<f64> {
+        let enode_struct_sh = |e: &Enode, sh: &Vec<u64>| -> u64 {
+            let mut h = fnv_bytes(FNV_OFF, funcs[e.func].term_name.as_bytes());
+            for &c in &e.ch_eq {
+                h = fnv_mix_u64(h, sh[c as usize]);
+            }
+            for (pos, v) in &e.ch_prim {
+                h = fnv_mix_u64(h, *pos as u64);
+                let mut hs = std::collections::hash_map::DefaultHasher::new();
+                v.hash(&mut hs);
+                h = fnv_mix_u64(h, hs.finish());
+            }
+            h
+        };
+
+        let enode_cost = |e: &Enode, costs: &Vec<f64>, sh: &Vec<u64>| -> Option<f64> {
             if e.head == 0.0 {
                 return Some(0.0);
             }
@@ -419,11 +455,8 @@ impl DagExtractor {
                 }
                 total += cc;
             }
-            let noise = (fnv_hash(
-                funcs[e.func].term_name.as_bytes(),
-                &e.all_children,
-            ) % 1024) as f64
-                * noise_scale;
+            // structural noise (was: hash over raw child Value bits)
+            let noise = (enode_struct_sh(e, sh) % 1024) as f64 * noise_scale;
             if fold_max {
                 Some(e.head + max_pos + eps * total + noise)
             } else {
@@ -439,16 +472,20 @@ impl DagExtractor {
             if !has_self_loop {
                 let v = comp[0] as usize;
                 let mut bc = f64::INFINITY;
+                let mut bsh = u64::MAX;
                 let mut bi: Option<usize> = None;
                 for &ei in &enodes_of[v] {
-                    if let Some(c) = enode_cost(&enodes[ei], &costs) {
-                        if c < bc {
+                    if let Some(c) = enode_cost(&enodes[ei], &costs, &sh) {
+                        let esh = enode_struct_sh(&enodes[ei], &sh);
+                        if c < bc || (c == bc && esh < bsh) {
                             bc = c;
+                            bsh = esh;
                             bi = Some(ei);
                         }
                     }
                 }
                 costs[v] = bc;
+                sh[v] = bsh;
                 best[v] = bi;
             } else {
                 let members: Vec<(u32, Vec<usize>)> = comp
@@ -469,9 +506,19 @@ impl DagExtractor {
                     for (v, ens) in &members {
                         let vi = *v as usize;
                         for &ei in ens {
-                            if let Some(c) = enode_cost(&enodes[ei], &costs) {
-                                if c < costs[vi] {
+                            if let Some(c) = enode_cost(&enodes[ei], &costs, &sh) {
+                                let esh = enode_struct_sh(&enodes[ei], &sh);
+                                let better = match best[vi] {
+                                    None => true,
+                                    Some(cur) => {
+                                        c < costs[vi]
+                                            || (c == costs[vi]
+                                                && esh < enode_struct_sh(&enodes[cur], &sh))
+                                    }
+                                };
+                                if better {
                                     costs[vi] = c;
+                                    sh[vi] = esh;
                                     best[vi] = Some(ei);
                                     changed = true;
                                 }
@@ -480,6 +527,24 @@ impl DagExtractor {
                     }
                 }
             }
+        }
+
+        // ---- optional determinism diagnostic ----
+        if std::env::var_os("EGGLOG_EXTRACT_DEBUG").is_some() {
+            let mut cost_sum: u64 = 0;
+            let mut struct_fnv: u64 = FNV_OFF;
+            let mut ids_fnv: u64 = FNV_OFF;
+            for (i, b) in best.iter().enumerate() {
+                if let Some(ei) = b {
+                    cost_sum = cost_sum.wrapping_add(costs[i].to_bits());
+                    struct_fnv = fnv_mix_u64(struct_fnv, sh[i]);
+                    ids_fnv = fnv_mix_u64(ids_fnv, *ei as u64);
+                }
+            }
+            eprintln!(
+                "[xdbg] classes={cls} cost_sum={cost_sum:#x} struct_fnv={struct_fnv:#x} ids_fnv={ids_fnv:#x}",
+                cls = classes.len()
+            );
         }
 
         // ---- optional SCC profiling (purely observational) ----
