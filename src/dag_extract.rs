@@ -17,190 +17,22 @@
 //! Costs are provided as a pure-Rust table (constructor egg-name -> head
 //! cost) plus a fold kind, so relaxation never calls into Python.
 //!
+//! The class-graph snapshot (whitelisted constructor enumeration, union-find
+//! canonicalization, class interning, SCC condensation) lives in
+//! `class_graph.rs` and is shared with the cut iterator.
+//!
 //! Scope: single eq-sort root (the caller's term sort), constructor
 //! whitelist vocabulary, primitives limited to `String` children.  The
 //! original `Extractor` remains the general-purpose fallback.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use pyo3::{exceptions::PyValueError, prelude::*};
 
+use crate::class_graph::{ClassGraph, SccProfile};
 use crate::{egraph::EGraph, egraph::Value, termdag::TermDag};
-use egglog::ast::Literal;
 use egglog::TermId;
-use egglog::Value as EggValue;
-
-const UNSUPPORTED: &str = "DagExtractor supports a single eq-sort root, whitelisted constructors, and String primitives only";
-
-struct FuncTab {
-    /// Term head used for reconstruction (the egg function name).
-    term_name: String,
-    /// Per child position: true if the child sort is the eq sort (a class).
-    eq_mask: Vec<bool>,
-    arity: usize,
-}
-
-struct Enode {
-    func: usize,
-    /// Class index of the output.
-    out: u32,
-    /// Class indices of eq children (in eq-position order).
-    ch_eq: Vec<u32>,
-    /// (position, value) of primitive (String) children.
-    ch_prim: Vec<(u32, EggValue)>,
-    /// All child values, for the deterministic tie-break hash.
-    all_children: Vec<EggValue>,
-    head: f64,
-}
-
-#[derive(Clone, Debug)]
-struct SccProfile {
-    num_classes: usize,
-    num_sccs: usize,
-    singleton_acyclic_nodes: usize,
-    self_loop_nodes: usize,
-    multi_node_nodes: usize,
-    max_size: usize,
-    mean_size: f64,
-    /// Population variance of SCC sizes (divide by k).
-    var_size: f64,
-    median_size: f64,
-    /// SCC size -> number of SCCs of that size.
-    histogram: Vec<(usize, usize)>,
-}
-
-impl SccProfile {
-    /// Purely observational statistics over the computed SCCs; reads `sccs`
-    /// and `adj` and influences nothing downstream.
-    fn compute(sccs: &[Vec<u32>], adj: &[Vec<u32>]) -> Self {
-        let num_classes: usize = sccs.iter().map(|c| c.len()).sum();
-        let num_sccs = sccs.len();
-        let mut sizes: Vec<usize> = Vec::with_capacity(num_sccs);
-        let mut singleton_acyclic_nodes = 0usize;
-        let mut self_loop_nodes = 0usize;
-        let mut multi_node_nodes = 0usize;
-        let mut histogram: HashMap<usize, usize> = HashMap::default();
-        for comp in sccs {
-            let size = comp.len();
-            sizes.push(size);
-            *histogram.entry(size).or_insert(0) += 1;
-            if size == 1 {
-                let v = comp[0] as usize;
-                if adj[v].iter().any(|&c| c == comp[0]) {
-                    self_loop_nodes += 1;
-                } else {
-                    singleton_acyclic_nodes += 1;
-                }
-            } else {
-                multi_node_nodes += size;
-            }
-        }
-        sizes.sort_unstable();
-        let max_size = sizes.last().copied().unwrap_or(0);
-        let mean_size = if num_sccs == 0 {
-            0.0
-        } else {
-            num_classes as f64 / num_sccs as f64
-        };
-        let var_size = if num_sccs == 0 {
-            0.0
-        } else {
-            sizes
-                .iter()
-                .map(|&s| {
-                    let d = s as f64 - mean_size;
-                    d * d
-                })
-                .sum::<f64>()
-                / num_sccs as f64
-        };
-        let median_size = if num_sccs == 0 {
-            0.0
-        } else if num_sccs % 2 == 1 {
-            sizes[num_sccs / 2] as f64
-        } else {
-            (sizes[num_sccs / 2 - 1] + sizes[num_sccs / 2]) as f64 / 2.0
-        };
-        let mut histogram: Vec<(usize, usize)> = histogram.into_iter().collect();
-        histogram.sort_unstable_by_key(|(s, _)| *s);
-        SccProfile {
-            num_classes,
-            num_sccs,
-            singleton_acyclic_nodes,
-            self_loop_nodes,
-            multi_node_nodes,
-            max_size,
-            mean_size,
-            var_size,
-            median_size,
-            histogram,
-        }
-    }
-
-    fn to_py_dict(&self, py: Python<'_>) -> PyObject {
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("num_classes", self.num_classes).unwrap();
-        d.set_item("num_sccs", self.num_sccs).unwrap();
-        d.set_item("singleton_acyclic_nodes", self.singleton_acyclic_nodes).unwrap();
-        d.set_item("self_loop_nodes", self.self_loop_nodes).unwrap();
-        d.set_item("multi_node_nodes", self.multi_node_nodes).unwrap();
-        let cyclic = self.self_loop_nodes + self.multi_node_nodes;
-        d.set_item("cyclic_nodes", cyclic).unwrap();
-        d.set_item("singleton_acyclic_pct", pct(self.singleton_acyclic_nodes, self.num_classes)).unwrap();
-        d.set_item("self_loop_pct", pct(self.self_loop_nodes, self.num_classes)).unwrap();
-        d.set_item("multi_node_pct", pct(self.multi_node_nodes, self.num_classes)).unwrap();
-        d.set_item("cyclic_pct", pct(cyclic, self.num_classes)).unwrap();
-        d.set_item("max_size", self.max_size).unwrap();
-        d.set_item("mean_size", self.mean_size).unwrap();
-        d.set_item("var_size", self.var_size).unwrap();
-        d.set_item("median_size", self.median_size).unwrap();
-        let hist = pyo3::types::PyDict::new(py);
-        for (s, c) in &self.histogram {
-            hist.set_item(s, c).unwrap();
-        }
-        d.set_item("size_histogram", hist).unwrap();
-        d.into_any().unbind()
-    }
-}
-
-fn pct(part: usize, total: usize) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        100.0 * part as f64 / total as f64
-    }
-}
-
-#[pyclass(unsendable)]
-pub struct DagExtractor {
-    funcs: Vec<FuncTab>,
-    enodes: Vec<Enode>,
-    classes: Vec<EggValue>,
-    costs: Vec<f64>,
-    best: Vec<Option<usize>>,
-    /// Persistent reconstruction memo (class idx -> TermId), shared by all
-    /// `extract_best` calls on this extractor (the TermDag is shared too).
-    memo: HashMap<u32, TermId>,
-    scc_profile: Option<SccProfile>,
-}
-
-fn fnv_hash(bytes: &[u8], vals: &[EggValue]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    for v in vals {
-        let mut hs = std::collections::hash_map::DefaultHasher::new();
-        v.hash(&mut hs);
-        for b in hs.finish().to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    }
-    h
-}
+use egglog::ast::Literal;
 
 const FNV_OFF: u64 = 0xcbf29ce484222325;
 
@@ -218,6 +50,17 @@ fn fnv_mix_u64(mut h: u64, w: u64) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+#[pyclass(unsendable)]
+pub struct DagExtractor {
+    graph: ClassGraph,
+    costs: Vec<f64>,
+    best: Vec<Option<usize>>,
+    /// Persistent reconstruction memo (class idx -> TermId), shared by all
+    /// `extract_best` calls on this extractor (the TermDag is shared too).
+    memo: HashMap<u32, TermId>,
+    scc_profile: Option<SccProfile>,
 }
 
 #[pymethods]
@@ -252,14 +95,6 @@ impl DagExtractor {
         noise_scale: f64,
         profile_sccs: bool,
     ) -> PyResult<Self> {
-        let eg = &egraph.egraph;
-        let root = eg
-            .get_sort_by_name(&sort)
-            .ok_or_else(|| PyValueError::new_err(format!("Unknown sort {sort}")))?
-            .clone();
-        if !root.is_eq_sort() {
-            return Err(PyValueError::new_err(format!("Root sort {sort} is not an eq sort")));
-        }
         let fold_max = match fold {
             "sum" => false,
             "max" => true,
@@ -269,153 +104,8 @@ impl DagExtractor {
                 )))
             }
         };
-
-        let mut funcs: Vec<FuncTab> = Vec::new();
-        let mut enodes: Vec<Enode> = Vec::new();
-        let mut class_index: HashMap<EggValue, u32> = HashMap::default();
-        let mut classes: Vec<EggValue> = Vec::new();
-        let mut enodes_of: Vec<Vec<usize>> = Vec::new();
-
-        for (name, head) in &head_costs {
-            let Some(f) = eg.get_function(name) else {
-                continue; // declared but absent from this e-graph
-            };
-            if f.is_let_binding() {
-                continue; // let-globals are references, not constructors
-            }
-            let schema = f.schema();
-            if schema.output.name() != root.name() {
-                return Err(PyValueError::new_err(format!(
-                    "Constructor {name} outputs sort {} (expected {})",
-                    schema.output.name(),
-                    root.name()
-                )));
-            }
-            let mut eq_mask = Vec::with_capacity(schema.input.len());
-            for s in &schema.input {
-                if s.is_eq_sort() {
-                    if s.name() != root.name() {
-                        return Err(PyValueError::new_err(UNSUPPORTED));
-                    }
-                    eq_mask.push(true);
-                } else if s.is_container_sort() || s.name() != "String" {
-                    return Err(PyValueError::new_err(UNSUPPORTED));
-                } else {
-                    eq_mask.push(false);
-                }
-            }
-            let fid = funcs.len();
-            funcs.push(FuncTab {
-                term_name: name.clone(),
-                eq_mask: eq_mask.clone(),
-                arity: schema.input.len(),
-            });
-
-            let arity = schema.input.len();
-            let mut rows: Vec<(Vec<EggValue>, EggValue)> = Vec::new();
-            eg.function_for_each(name, |row| {
-                if !row.subsumed && row.vals.len() == arity + 1 {
-                    rows.push((row.vals[..arity].to_vec(), row.vals[arity]));
-                }
-            })
-            .map_err(|e| PyValueError::new_err(format!("reading function {name}: {e}")))?;
-
-            for (children, out) in rows {
-                let mut ch_eq = Vec::new();
-                let mut ch_prim = Vec::new();
-                for (pos, (is_eq, v)) in eq_mask.iter().zip(children.iter()).enumerate() {
-                    if *is_eq {
-                        let cv = eg.get_canonical_value(*v, &root);
-                        let i = class_index.get(&cv).copied().unwrap_or_else(|| {
-                            let i = classes.len() as u32;
-                            classes.push(cv);
-                            class_index.insert(cv, i);
-                            enodes_of.push(Vec::new());
-                            i
-                        });
-                        ch_eq.push(i);
-                    } else {
-                        ch_prim.push((pos as u32, *v));
-                    }
-                }
-                let out_c = eg.get_canonical_value(out, &root);
-                let oi = class_index.get(&out_c).copied().unwrap_or_else(|| {
-                    let i = classes.len() as u32;
-                    classes.push(out_c);
-                    class_index.insert(out_c, i);
-                    enodes_of.push(Vec::new());
-                    i
-                });
-                let e = Enode {
-                    func: fid,
-                    out: oi,
-                    ch_eq,
-                    ch_prim,
-                    all_children: children,
-                    head: *head,
-                };
-                enodes_of[oi as usize].push(enodes.len());
-                enodes.push(e);
-            }
-        }
-
-        let n = classes.len();
-        // adjacency: parent class -> child classes (for Tarjan)
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for e in &enodes {
-            for &c in &e.ch_eq {
-                adj[e.out as usize].push(c);
-            }
-        }
-
-        // ---- iterative Tarjan SCC; sccs emitted children-first ----
-        let mut disc: Vec<u32> = vec![u32::MAX; n];
-        let mut low: Vec<u32> = vec![0; n];
-        let mut on_stack = vec![false; n];
-        let mut tstack: Vec<u32> = Vec::new();
-        let mut sccs: Vec<Vec<u32>> = Vec::new();
-        let mut counter: u32 = 0;
-        for start in 0..n {
-            if disc[start] != u32::MAX {
-                continue;
-            }
-            let mut call: Vec<(u32, usize)> = vec![(start as u32, 0)];
-            while let Some(&mut (u, ref mut ei)) = call.last_mut() {
-                if *ei == 0 {
-                    disc[u as usize] = counter;
-                    low[u as usize] = counter;
-                    counter += 1;
-                    tstack.push(u);
-                    on_stack[u as usize] = true;
-                }
-                if *ei < adj[u as usize].len() {
-                    let v = adj[u as usize][*ei];
-                    *ei += 1;
-                    if disc[v as usize] == u32::MAX {
-                        call.push((v, 0));
-                    } else if on_stack[v as usize] {
-                        low[u as usize] = low[u as usize].min(disc[v as usize]);
-                    }
-                } else {
-                    call.pop();
-                    if let Some(&(p, _)) = call.last() {
-                        low[p as usize] = low[p as usize].min(low[u as usize]);
-                    }
-                    if low[u as usize] == disc[u as usize] {
-                        let mut comp = Vec::new();
-                        loop {
-                            let w = tstack.pop().unwrap();
-                            on_stack[w as usize] = false;
-                            comp.push(w);
-                            if w == u {
-                                break;
-                            }
-                        }
-                        sccs.push(comp);
-                    }
-                }
-            }
-        }
+        let graph = ClassGraph::build(&egraph.egraph, &sort, &head_costs)?;
+        let n = graph.classes.len();
 
         // ---- levelized DP over SCCs (children-first order) ----
         let mut costs: Vec<f64> = vec![f64::INFINITY; n];
@@ -425,48 +115,51 @@ impl DagExtractor {
         // stable even if e-class numbering or intern order shifts per process.
         let mut sh: Vec<u64> = vec![0; n];
 
-        let enode_struct_sh = |e: &Enode, sh: &Vec<u64>| -> u64 {
-            let mut h = fnv_bytes(FNV_OFF, funcs[e.func].term_name.as_bytes());
-            for &c in &e.ch_eq {
-                h = fnv_mix_u64(h, sh[c as usize]);
-            }
-            for (pos, v) in &e.ch_prim {
-                h = fnv_mix_u64(h, *pos as u64);
-                let mut hs = std::collections::hash_map::DefaultHasher::new();
-                v.hash(&mut hs);
-                h = fnv_mix_u64(h, hs.finish());
-            }
-            h
-        };
-
-        let enode_cost = |e: &Enode, costs: &Vec<f64>, sh: &Vec<u64>| -> Option<f64> {
-            if e.head == 0.0 {
-                return Some(0.0);
-            }
-            let mut total = 0.0;
-            let mut max_pos = 0.0f64;
-            for &c in &e.ch_eq {
-                let cc = costs[c as usize];
-                if !cc.is_finite() {
-                    return None; // child unfinalized (same SCC) or unextractable
+        let enode_struct_sh =
+            |e: &crate::class_graph::Enode, sh: &Vec<u64>| -> u64 {
+                let mut h = fnv_bytes(FNV_OFF, graph.funcs[e.func].term_name.as_bytes());
+                for &c in &e.ch_eq {
+                    h = fnv_mix_u64(h, sh[c as usize]);
                 }
-                if cc > max_pos {
-                    max_pos = cc;
+                for (pos, v) in &e.ch_prim {
+                    h = fnv_mix_u64(h, *pos as u64);
+                    let mut hs = std::collections::hash_map::DefaultHasher::new();
+                    use std::hash::{Hash, Hasher};
+                    v.hash(&mut hs);
+                    h = fnv_mix_u64(h, hs.finish());
                 }
-                total += cc;
-            }
-            // structural noise (was: hash over raw child Value bits)
-            let noise = (enode_struct_sh(e, sh) % 1024) as f64 * noise_scale;
-            if fold_max {
-                Some(e.head + max_pos + eps * total + noise)
-            } else {
-                Some(e.head + total + noise)
-            }
-        };
+                h
+            };
 
-        for comp in &sccs {
+        let enode_cost =
+            |e: &crate::class_graph::Enode, costs: &Vec<f64>, sh: &Vec<u64>| -> Option<f64> {
+                if e.head == 0.0 {
+                    return Some(0.0);
+                }
+                let mut total = 0.0;
+                let mut max_pos = 0.0f64;
+                for &c in &e.ch_eq {
+                    let cc = costs[c as usize];
+                    if !cc.is_finite() {
+                        return None; // child unfinalized (same SCC) or unextractable
+                    }
+                    if cc > max_pos {
+                        max_pos = cc;
+                    }
+                    total += cc;
+                }
+                // structural noise (was: hash over raw child Value bits)
+                let noise = (enode_struct_sh(e, sh) % 1024) as f64 * noise_scale;
+                if fold_max {
+                    Some(e.head + max_pos + eps * total + noise)
+                } else {
+                    Some(e.head + total + noise)
+                }
+            };
+
+        for comp in &graph.sccs {
             let has_self_loop = comp.len() > 1
-                || adj[comp[0] as usize]
+                || graph.adj[comp[0] as usize]
                     .iter()
                     .any(|&c| c == comp[0]);
             if !has_self_loop {
@@ -474,9 +167,9 @@ impl DagExtractor {
                 let mut bc = f64::INFINITY;
                 let mut bsh = u64::MAX;
                 let mut bi: Option<usize> = None;
-                for &ei in &enodes_of[v] {
-                    if let Some(c) = enode_cost(&enodes[ei], &costs, &sh) {
-                        let esh = enode_struct_sh(&enodes[ei], &sh);
+                for &ei in &graph.enodes_of[v] {
+                    if let Some(c) = enode_cost(&graph.enodes[ei], &costs, &sh) {
+                        let esh = enode_struct_sh(&graph.enodes[ei], &sh);
                         if c < bc || (c == bc && esh < bsh) {
                             bc = c;
                             bsh = esh;
@@ -490,7 +183,7 @@ impl DagExtractor {
             } else {
                 let members: Vec<(u32, Vec<usize>)> = comp
                     .iter()
-                    .map(|v| (*v, enodes_of[*v as usize].clone()))
+                    .map(|v| (*v, graph.enodes_of[*v as usize].clone()))
                     .collect();
                 let mut changed = true;
                 let mut iters = 0usize;
@@ -506,14 +199,14 @@ impl DagExtractor {
                     for (v, ens) in &members {
                         let vi = *v as usize;
                         for &ei in ens {
-                            if let Some(c) = enode_cost(&enodes[ei], &costs, &sh) {
-                                let esh = enode_struct_sh(&enodes[ei], &sh);
+                            if let Some(c) = enode_cost(&graph.enodes[ei], &costs, &sh) {
+                                let esh = enode_struct_sh(&graph.enodes[ei], &sh);
                                 let better = match best[vi] {
                                     None => true,
                                     Some(cur) => {
                                         c < costs[vi]
                                             || (c == costs[vi]
-                                                && esh < enode_struct_sh(&enodes[cur], &sh))
+                                                && esh < enode_struct_sh(&graph.enodes[cur], &sh))
                                     }
                                 };
                                 if better {
@@ -543,21 +236,19 @@ impl DagExtractor {
             }
             eprintln!(
                 "[xdbg] classes={cls} cost_sum={cost_sum:#x} struct_fnv={struct_fnv:#x} ids_fnv={ids_fnv:#x}",
-                cls = classes.len()
+                cls = graph.classes.len()
             );
         }
 
         // ---- optional SCC profiling (purely observational) ----
         let scc_profile = if profile_sccs {
-            Some(SccProfile::compute(&sccs, &adj))
+            Some(SccProfile::compute(&graph.sccs, &graph.adj))
         } else {
             None
         };
 
         Ok(DagExtractor {
-            funcs,
-            enodes,
-            classes,
+            graph,
             costs,
             best,
             memo: HashMap::default(),
@@ -580,10 +271,9 @@ impl DagExtractor {
             .get_sort_by_name(&sort)
             .ok_or_else(|| PyValueError::new_err(format!("Unknown sort {sort}")))?;
         let canonical = eg.get_canonical_value(value.0, root);
-        let Some(idx) = self.classes.iter().position(|c| *c == canonical) else {
+        let Some(&idx) = self.graph.class_index.get(&canonical) else {
             return Err(PyValueError::new_err("Unextractable root"));
         };
-        let idx = idx as u32;
         let cost = self.costs[idx as usize];
         if !cost.is_finite() {
             return Err(PyValueError::new_err("Unextractable root"));
@@ -595,13 +285,13 @@ impl DagExtractor {
     /// Number of DP classes (debug/introspection).
     #[getter]
     fn num_classes(&self) -> usize {
-        self.classes.len()
+        self.graph.classes.len()
     }
 
     /// Number of whitelisted enodes (debug/introspection).
     #[getter]
     fn num_enodes(&self) -> usize {
-        self.enodes.len()
+        self.graph.enodes.len()
     }
 
     /// SCC condensation statistics, or None when the extractor was built
@@ -647,9 +337,9 @@ impl DagExtractor {
                     let Some(ei) = self.best[v as usize] else {
                         return Err(PyValueError::new_err("Unextractable class"));
                     };
-                    let arity = self.funcs[self.enodes[ei].func].arity;
+                    let arity = self.graph.funcs[self.graph.enodes[ei].func].arity;
                     if arity == 0 {
-                        let name = self.funcs[self.enodes[ei].func].term_name.clone();
+                        let name = self.graph.funcs[self.graph.enodes[ei].func].term_name.clone();
                         let t = termdag.0.app(name, Vec::new());
                         self.memo.insert(v, t);
                         results.push(t);
@@ -658,8 +348,8 @@ impl DagExtractor {
                     let mut slots: Vec<Option<TermId>> = vec![None; arity];
                     let mut to_enter: Vec<u32> = Vec::new();
                     {
-                        let e = &self.enodes[ei];
-                        let mask = &self.funcs[e.func].eq_mask;
+                        let e = &self.graph.enodes[ei];
+                        let mask = &self.graph.funcs[e.func].eq_mask;
                         let mut eq_iter = e.ch_eq.iter();
                         let mut prim_iter = e.ch_prim.iter();
                         for (pos, is_eq) in mask.iter().enumerate() {
@@ -717,7 +407,7 @@ impl DagExtractor {
                         .map(|s| s.expect("all slots filled"))
                         .collect();
                     let ei = self.best[class as usize].expect("best edge exists");
-                    let name = self.funcs[self.enodes[ei].func].term_name.clone();
+                    let name = self.graph.funcs[self.graph.enodes[ei].func].term_name.clone();
                     let t = termdag.0.app(name, children);
                     self.memo.insert(class, t);
                     results.push(t);

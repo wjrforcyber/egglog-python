@@ -9,8 +9,14 @@ edition = "2024"
 name = "egglog"
 crate-type = ["cdylib"]
 
+[features]
+# extension-module is default-on for wheels; `cargo test --no-default-features`
+# links libpython so Rust unit tests can run natively.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module", "num-bigint", "num-rational", "indexmap"] }
+pyo3 = { version = "0.27", features = ["num-bigint", "num-rational", "indexmap"] }
 num-bigint = "*"
 num-rational = "*"
 indexmap = "2.12"

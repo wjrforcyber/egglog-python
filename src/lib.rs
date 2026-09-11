@@ -1,4 +1,7 @@
+mod class_graph;
 mod conversions;
+mod cut_iter;
+mod cut_map;
 mod dag_extract;
 mod egraph;
 mod error;
@@ -53,6 +56,9 @@ fn bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::extract::Extractor>()?;
     m.add_class::<crate::extract::CostModel>()?;
     m.add_class::<crate::dag_extract::DagExtractor>()?;
+    m.add_class::<crate::cut_iter::CutIterator>()?;
+    m.add_class::<crate::cut_map::CutMapper>()?;
+    m.add_function(wrap_pyfunction!(crate::cut_iter::op_truth_table, m)?)?;
     m.add_class::<crate::freeze::FrozenRow>()?;
     m.add_class::<crate::freeze::FrozenFunction>()?;
     m.add_class::<crate::freeze::FrozenEGraph>()?;
