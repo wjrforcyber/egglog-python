@@ -573,7 +573,7 @@ impl CutMapper {
     /// {class_id: {"cell": name, "inputs": [class ids in cell-pin order],
     /// "cut": cut idx, "arrival": f, "flow": f}}.
     #[getter]
-    fn decisions<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn decisions<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let d = pyo3::types::PyDict::new(py);
         for (v, ch) in self.choices.iter().enumerate() {
             let Some(ch) = ch else { continue };
@@ -590,7 +590,7 @@ impl CutMapper {
 
     /// Cone classes that cannot be emitted (no cut matched the library).
     #[getter]
-    fn unmatched_classes<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn unmatched_classes<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let l = pyo3::types::PyList::empty(py);
         for (v, ok) in self.emit_ok.iter().enumerate() {
             if !ok {
@@ -602,7 +602,7 @@ impl CutMapper {
 
     /// PI classes: {class_id: PI name (the var primitive)}.
     #[getter]
-    fn pi_names<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn pi_names<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let d = pyo3::types::PyDict::new(py);
         for (k, v) in &self.pi_names {
             d.set_item(k, v)?;
@@ -612,7 +612,7 @@ impl CutMapper {
 
     /// Constant classes: {class_id: 0 | 1}.
     #[getter]
-    fn const_classes<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn const_classes<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let d = pyo3::types::PyDict::new(py);
         for (k, v) in &self.const_classes {
             d.set_item(k, v)?;
@@ -622,7 +622,7 @@ impl CutMapper {
 
     /// Mapping statistics.
     #[getter]
-    fn stats<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let s = &self.stats;
         let d = pyo3::types::PyDict::new(py);
         d.set_item("num_classes", s.num_classes)?;

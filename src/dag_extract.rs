@@ -297,7 +297,7 @@ impl DagExtractor {
     /// SCC condensation statistics, or None when the extractor was built
     /// without `profile_sccs=True`.
     #[getter]
-    fn scc_profile<'py>(&self, py: Python<'py>) -> Option<PyObject> {
+    fn scc_profile<'py>(&self, py: Python<'py>) -> Option<Py<PyAny>> {
         self.scc_profile.as_ref().map(|p| p.to_py_dict(py))
     }
 }

@@ -12,7 +12,7 @@ import pytest
 from sklearn import config_context, datasets
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
-from egglog import greedy_dag_cost_model, set_current_ruleset
+from egglog import set_current_ruleset
 from egglog.exp.array_api import *
 from egglog.exp.array_api import NDArray, Value
 from egglog.exp.array_api_jit import function_to_program, jit
@@ -45,6 +45,10 @@ def test_vecdot_eval_numpy_uses_fresh_egraph():
     n = NDArray([0.0, 0.6, 0.8])
 
     assert vecdot(v, n).eval_numpy(np.dtype("float64")).tolist() == pytest.approx([3.0, 8.0, 10.0])
+
+
+def test_ndarray_device_is_cpu():
+    check_eq(NDArray((1, 2, 3)).device, Device.cpu, array_api_schedule)
 
 
 @function(ruleset=array_api_ruleset)
@@ -263,11 +267,14 @@ def linalg_norm(X: NDArray, axis: TupleIntLike) -> NDArray:
     return NDArray.fn(
         outshape,
         X.dtype,
-        lambda k: LoopNestAPI.from_tuple(reduce_axis)
-        .unwrap()
-        .indices()
-        .foldl_value(lambda carry, i: carry + ((x := X.index(i + k)).conj() * x).real(), init=0.0)
-        .sqrt(),
+        lambda k: (
+            LoopNestAPI
+            .from_tuple(reduce_axis)
+            .unwrap()
+            .indices()
+            .foldl_value(lambda carry, i: carry + ((x := X.index(i + k)).conj() * x).real(), init=0.0)
+            .sqrt()
+        ),
     )
 
 
@@ -277,9 +284,11 @@ def linalg_norm_v2(X: NDArrayLike, axis: TupleIntLike) -> NDArray:
     return NDArray.fn(
         X.shape.deselect(axis),
         X.dtype,
-        lambda k: ndindex(X.shape.select(axis))
-        .foldl_value(lambda carry, i: carry + ((x := X.index(i + k)).conj() * x).real(), init=0.0)
-        .sqrt(),
+        lambda k: (
+            ndindex(X.shape.select(axis))
+            .foldl_value(lambda carry, i: carry + ((x := X.index(i + k)).conj() * x).real(), init=0.0)
+            .sqrt()
+        ),
     )
 
 
@@ -379,7 +388,7 @@ def test_program_compile(program: Program, snapshot_py):
     egraph = EGraph()
     egraph.register(program)
     egraph.run(array_api_numba_schedule)
-    simplified_program = egraph.extract(program, cost_model=greedy_dag_cost_model())
+    simplified_program = egraph.extract(program, extractor="greedy-dag")
     assert str(simplified_program) == snapshot_py(name="expr")
     egraph = EGraph()
     egraph.register(simplified_program.compile())

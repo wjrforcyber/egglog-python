@@ -4,6 +4,177 @@ _This project uses semantic versioning_
 
 ## UNRELEASED
 
+- Publish releases with `uv`, then tag and fast-forward `main` directly without a release PR or redundant CI.
+- Fix missing macOS wheels for standard CPython 3.14 when building alongside free-threaded Python.
+
+## 14.0.0 (2026-09-20)
+
+This release brings Egglog 3 to Python, with sharing-aware extraction, additive
+custom cost models, and beta support for free-threaded Python. Here are a few
+examples to try with `pip install egglog==14.0.0` or `uv pip install egglog==14.0.0`.
+
+### Greedy-DAG extraction
+
+The default tree extractor counts repeated subexpressions each time they occur.
+Use `extractor="greedy-dag"` to charge shared subexpressions only once. For example,
+adding an expensive expression to itself can be cheaper than multiplying it by two:
+
+```python
+from __future__ import annotations
+
+from egglog import EGraph, Expr, i64Like, method, union
+
+
+class Math(Expr):
+    def __init__(self, value: i64Like) -> None: ...
+
+    @method(cost=10)
+    def exp(self) -> Math: ...
+
+    @method(cost=1)
+    def __add__(self, other: Math) -> Math: ...
+
+    @method(cost=3)
+    def __mul__(self, other: Math) -> Math: ...
+
+
+egraph = EGraph()
+shared = Math(1).exp()
+expr = shared + shared
+egraph.register(union(expr).with_(Math(2) * shared))
+
+print(egraph.extract(expr, include_cost=True, extractor="tree"))
+# (Math(2) * Math(1).exp(), 17)
+print(egraph.extract(expr, include_cost=True, extractor="greedy-dag"))
+# (Math(1).exp() + Math(1).exp(), 13)
+```
+
+The tree extractor avoids paying for `exp()` twice; the DAG extractor shares it.
+The printed Python expression repeats the call, but the DAG cost counts it once.
+Greedy-DAG extraction is a heuristic, not a guarantee of the globally cheapest DAG.
+
+### Custom costs
+
+A `DagCostModel` works with either extractor. Its callback gives the cost of one
+node, without its children; the extractor accounts for repetition or sharing.
+Continuing the example, making addition expensive changes the DAG result:
+
+```python
+from egglog import BaseExpr, DagCostModel, default_cost_model, get_callable_fn
+
+
+def expensive_addition(egraph: EGraph, node: BaseExpr) -> int:
+    if get_callable_fn(node) == Math.__add__:
+        return 100
+    return default_cost_model(egraph, node, [])
+
+
+model = DagCostModel(expensive_addition, identity=0)
+print(egraph.extract(expr, include_cost=True, extractor="greedy-dag", cost_model=model))
+# (Math(2) * Math(1).exp(), 17)
+```
+
+More general callbacks that combine child costs remain available as `TreeCostModel`
+for tree extraction. See [extraction and cost models](reference/python-integration.md#extraction-and-cost-models).
+
+### Eager functions and optional values
+
+By default, function bodies now evaluate in Egglog without needing a ruleset run.
+Combine them with `catch` and the new `Maybe[T]` sort to handle undefined primitive
+calls, such as missing map entries:
+
+```python
+from egglog import EGraph, Map, String, catch, function, i64
+
+
+@function
+def lookup_or_zero(values: Map[String, i64], key: String) -> i64:
+    return catch(lambda: values[key]).unwrap_or(i64(0))
+
+
+values = Map[String, i64].empty().insert("answer", 42)
+egraph = EGraph()
+print(egraph.extract(lookup_or_zero(values, "answer")).value)  # 42
+print(egraph.extract(lookup_or_zero(values, "missing")).value)  # 0
+```
+
+See [generic container operations](reference/egglog-translation.md#generic-container-operations)
+for `Pair`, `Maybe`, and map folding, and [function declarations](reference/egglog-translation.md#functions-vs-constructors)
+for when a body remains rewrite-backed.
+
+### More highlights
+
+- [Multi-root extraction](reference/python-integration.md#multiple-roots):
+  `egraph.extract_multiple([expr1, expr2], 3, extractor="greedy-dag")` returns up to
+  three variants per root, in input order. Each root is costed independently.
+- [Persistent backoff](reference/egglog-translation.md#schedules):
+  `back_off(match_limit=1000).persistent()` keeps rule bans across separate
+  `EGraph.run()` calls. `RunReport.can_stop` distinguishes saturation from a round
+  with temporarily deferred work.
+- [Parallelism](reference/usage.md#parallelism-and-threads): `EGraph(num_threads=4)`
+  configures Rust workers per e-graph. CPython 3.12–3.14 are supported, with beta
+  support for 3.14t; concurrent Python use requires the documented
+  [thread-safety setup](reference/python-integration.md#thread-safety).
+
+### Changes and compatibility
+
+- Fix release version bumps to update `Cargo.lock` before building locked wheels.
+
+- Modernize dependencies and CI [#425](https://github.com/egraphs-good/egglog-python/pull/425).
+  - BREAKING: Drop Python 3.11 support; supported CPython versions are now 3.12-3.14.
+  - Add beta support for free-threaded CPython 3.14t; see
+    [thread safety](reference/python-integration.md#thread-safety).
+  - Add `Device.cpu`, returned by `NDArray.device` in the experimental array API.
+  - Fix table lookups from custom extraction-cost callbacks when expressions are reused.
+
+- Make shared-subexpression hoisting deterministic across Python processes,
+  stabilizing generated `let` bindings and serialized e-graph output
+  [#422](https://github.com/egraphs-good/egglog-python/pull/422).
+
+- Upgrade to Egglog 3 and matching `egglog-experimental` APIs
+  [#414](https://github.com/egraphs-good/egglog-python/pull/414).
+  - BREAKING: container rebuilding is now handled by Egglog, so `Map.rebuild()`,
+    `Set.rebuild()`, and `Vec.rebuild()` are removed; configure threads through
+    `EGraph(num_threads=...)` instead of `RAYON_NUM_THREADS`; and replace the
+    removed greedy-DAG cost helpers with `DagCostModel` and
+    `extractor="greedy-dag"`.
+  - BREAKING: function, method, constant, and class-variable bodies now execute
+    eagerly unless an explicit `ruleset` keeps an eqsort body rewrite-backed.
+    Add merged constants, `reverse_args` support for bodies, per-rule evaluation
+    modes and decomposition control, and clear errors for invalid callable
+    option combinations and non-call top-level expression actions.
+  - Add generic `Pair` and `Maybe` values, `catch`, map folding, map/set lengths,
+    more `f64` operations including `is_finite()`, integer coercions, exact
+    `BigRat.to_i64()`, and `RationalLike` inputs, reflected arithmetic, and
+    comparisons for the experimental `Rational` API. Also fix duplicate map
+    keys and duplicate set iteration values.
+  - Add tree and greedy-DAG extraction modes, ordered multi-root variant
+    extraction, destructive `keep_best`, consistent dynamic `set_cost` support,
+    and custom `TreeCostModel` and additive `DagCostModel` callbacks. Custom-cost
+    failures now propagate without partially updating output term DAGs, and
+    opaque lookup values from another e-graph, a popped scope, or before
+    compaction are rejected. User-declared raw cost tables can be reused for
+    table-backed callables, but not for eager or builtin primitives whose valid
+    rows cannot be recovered from a snapshot.
+  - Add persistent backoff schedules, `RunReport.can_stop`, per-e-graph thread
+    and decomposition settings, constructor/relation table inspection, generic
+    value extraction, and `var()` typing for parameterized expression types.
+    Correct run-report durations that were previously 1,000 times too small.
+    Add removable source transcripts that preserve rule evaluation and
+    decomposition settings, use replay-safe names, report source-aware parse
+    errors, and reject use after non-replayable failures.
+    Python exceptions raised by `PyObject` primitives on worker threads now
+    propagate to the caller, and the low-level bindings round-trip Egglog 3
+    AST/report data, parse and run source programs directly, and expose
+    structured experimental multi-extraction results. Generated backend names
+    remain fully qualified, avoid spellings parsed as Egglog syntax, and
+    reserve explicit names before lowering so ordinary explicit names remain
+    available regardless of action order within one registration batch.
+  - Preserve the paused Param-Eq work as a reusable experimental module and CLI,
+    three bounded CI stress cases, and an optional external-corpus harness with
+    explicit iteration-limit, timeout, memory-limit, error, and provenance
+    reporting.
+
 ## 13.2.0 (2026-06-03)
 
 - Add Python-friendly `RunReport` wrapper that returns `CommandDecl` objects as rule keys instead of raw egglog s-expression strings, with pretty-printed Python syntax in `str()` output [#416](https://github.com/egraphs-good/egglog-python/pull/416)
@@ -37,7 +208,7 @@ _This project uses semantic versioning_
 - Add support for setting report level with `egraph.set_report_level` [#375](https://github.com/egraphs-good/egglog-python/pull/375)
 - Make docs builds fail on notebook execution errors and fix all doc issues [#369](https://github.com/egraphs-good/egglog-python/pull/369)
 - Add WIP `egglog.exp.any_expr` code for tracing arbitrary expressions with Python fallback [#366](https://github.com/egraphs-good/egglog-python/pull/366)
-  - BREAKING: Remove support for Python 3.11 now that pyo3 has dropped support.
+  - BREAKING: Remove support for Python 3.10.
   - Allow mutating methods to update their underlying expression via `Expr.__replace_expr__`, and ensure default rewrites return the mutated receiver when using `mutates_self` or `mutates_first_arg`.
   - BREAKING: Store `PyObject` values as `cloudpickle` bytes instead of live references so duplicates merge by value; `.value` now returns a fresh copy and the sort accepts objects like `None` that previously failed.
   - Adds a `__call__` method (and `call_extended` for kwargs) to `PyObject` to replace `py_eval_fn`, which is now deprecated.
@@ -210,15 +381,18 @@ a linalg function (in [an example inspired by Siu](https://gist.github.com/sklam
 ```python
 from egglog.exp.array_api import *
 
+
 @function(ruleset=array_api_ruleset, subsume=True)
 def linalg_norm(X: NDArrayLike, axis: TupleIntLike) -> NDArray:
     X = cast(NDArray, X)
     return NDArray(
         X.shape.deselect(axis),
         X.dtype,
-        lambda k: ndindex(X.shape.select(axis))
-        .foldl_value(lambda carry, i: carry + ((x := X.index(i + k)).conj() * x).real(), init=0.0)
-        .sqrt(),
+        lambda k: (
+            ndindex(X.shape.select(axis))
+            .foldl_value(lambda carry, i: carry + ((x := X.index(i + k)).conj() * x).real(), init=0.0)
+            .sqrt()
+        ),
     )
 ```
 
@@ -372,8 +546,8 @@ rule or expression. For example:
 class A(Expr):
     def __init__(self, b: B) -> None: ...
 
-class B(Expr):
-    ...
+
+class B(Expr): ...
 ```
 
 ### Top level commands

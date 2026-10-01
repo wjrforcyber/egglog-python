@@ -744,7 +744,7 @@ impl CutIterator {
 
     /// Enumeration statistics.
     #[getter]
-    fn stats<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let s = &self.result.stats;
         let d = pyo3::types::PyDict::new(py);
         d.set_item("k", s.k)?;
@@ -777,7 +777,7 @@ impl CutIterator {
         value: Value,
         sort: String,
         py: Python<'py>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let idx = self.class_of_impl(&egraph.egraph, value, &sort)?;
         let out = pyo3::types::PyList::empty(py);
         for c in &self.result.cuts[idx as usize] {
@@ -976,7 +976,7 @@ impl CutIterator {
     }
 
     /// E-nodes of one class by internal id (debug/diagnosis).
-    fn enodes_of_class<'py>(&self, class: usize, py: Python<'py>) -> PyResult<PyObject> {
+    fn enodes_of_class<'py>(&self, class: usize, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let out = pyo3::types::PyList::empty(py);
         let Some(eis) = self.graph.enodes_of.get(class) else {
             return Err(pyo3::exceptions::PyIndexError::new_err(class));
@@ -1000,7 +1000,7 @@ impl CutIterator {
 
     /// Cut list of one class by internal id (debug/diagnosis; same shape as
     /// `cuts_of`).
-    fn cuts_of_class<'py>(&self, class: usize, py: Python<'py>) -> PyResult<PyObject> {
+    fn cuts_of_class<'py>(&self, class: usize, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let out = pyo3::types::PyList::empty(py);
         let Some(list) = self.result.cuts.get(class) else {
             return Err(pyo3::exceptions::PyIndexError::new_err(class));

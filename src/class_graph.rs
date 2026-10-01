@@ -125,7 +125,7 @@ impl SccProfile {
         }
     }
 
-    pub(crate) fn to_py_dict(&self, py: Python<'_>) -> PyObject {
+    pub(crate) fn to_py_dict(&self, py: Python<'_>) -> Py<PyAny> {
         let d = pyo3::types::PyDict::new(py);
         d.set_item("num_classes", self.num_classes).unwrap();
         d.set_item("num_sccs", self.num_sccs).unwrap();
@@ -160,6 +160,25 @@ pub(crate) fn pct(part: usize, total: usize) -> f64 {
 }
 
 #[derive(Clone)]
+/// Canonicalize `value` through the sort's union-find table (one hop to
+/// canonical, mirroring the core extractor's `find_canonical`).
+fn canonical_value(eg: &egglog::EGraph, sort: &egglog::ArcSort, value: EggValue) -> EggValue {
+    let Some(uf_name) = eg.proof_state.uf_parent.get(sort.name()) else {
+        return value;
+    };
+    let Some(uf_func) = eg.functions.get(uf_name) else {
+        return value;
+    };
+    let mut canonical = value;
+    eg.backend
+        .for_each(uf_func.backend_id, |row: egglog_bridge::ScanEntry| {
+            if row.vals[0] == value {
+                canonical = row.vals[1];
+            }
+        });
+    canonical
+}
+
 pub(crate) struct ClassGraph {
     pub(crate) funcs: Vec<FuncTab>,
     pub(crate) enodes: Vec<Enode>,
@@ -211,16 +230,16 @@ impl ClassGraph {
             if f.is_let_binding() {
                 continue; // let-globals are references, not constructors
             }
-            let schema = f.schema();
-            if schema.output.name() != root.name() {
+            let ftype = f.func_type();
+            if ftype.output.name() != root.name() {
                 return Err(PyValueError::new_err(format!(
                     "Constructor {name} outputs sort {} (expected {})",
-                    schema.output.name(),
+                    ftype.output.name(),
                     root.name()
                 )));
             }
-            let mut eq_mask = Vec::with_capacity(schema.input.len());
-            for s in &schema.input {
+            let mut eq_mask = Vec::with_capacity(ftype.input.len());
+            for s in &ftype.input {
                 if s.is_eq_sort() {
                     if s.name() != root.name() {
                         return Err(PyValueError::new_err(UNSUPPORTED));
@@ -236,24 +255,24 @@ impl ClassGraph {
             funcs.push(FuncTab {
                 term_name: name.clone(),
                 eq_mask: eq_mask.clone(),
-                arity: schema.input.len(),
+                arity: ftype.input.len(),
             });
 
-            let arity = schema.input.len();
+            let arity = ftype.input.len();
             let mut rows: Vec<(Vec<EggValue>, EggValue)> = Vec::new();
-            eg.function_for_each(name, |row| {
-                if !row.subsumed && row.vals.len() == arity + 1 {
-                    rows.push((row.vals[..arity].to_vec(), row.vals[arity]));
-                }
-            })
-            .map_err(|e| PyValueError::new_err(format!("reading function {name}: {e}")))?;
+            eg.backend
+                .for_each(f.backend_id, |row: egglog_bridge::ScanEntry| {
+                    if !row.subsumed && row.vals.len() == arity + 1 {
+                        rows.push((row.vals[..arity].to_vec(), row.vals[arity]));
+                    }
+                });
 
             for (children, out) in rows {
                 let mut ch_eq = Vec::new();
                 let mut ch_prim = Vec::new();
                 for (pos, (is_eq, v)) in eq_mask.iter().zip(children.iter()).enumerate() {
                     if *is_eq {
-                        let cv = eg.get_canonical_value(*v, &root);
+                        let cv = canonical_value(eg, &root, *v);
                         let i = class_index.get(&cv).copied().unwrap_or_else(|| {
                             let i = classes.len() as u32;
                             classes.push(cv);
@@ -266,7 +285,7 @@ impl ClassGraph {
                         ch_prim.push((pos as u32, *v));
                     }
                 }
-                let out_c = eg.get_canonical_value(out, &root);
+                let out_c = canonical_value(eg, &root, out);
                 let oi = class_index.get(&out_c).copied().unwrap_or_else(|| {
                     let i = classes.len() as u32;
                     classes.push(out_c);

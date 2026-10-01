@@ -18,7 +18,7 @@ _NDArray_3 = astype(
     ),
     DType.float64,
 ) / NDArray(RecursiveValue(Value.from_int(Int(150))))
-_NDArray_4 = zeros(TupleInt(Vec(Int(3), Int(4))), OptionalDType.some(DType.float64), OptionalDevice.some(_NDArray_1.device))
+_NDArray_4 = zeros(TupleInt(Vec(Int(3), Int(4))), OptionalDType.some(DType.float64), OptionalDevice.some(Device.cpu))
 _MultiAxisIndexKeyItem_1 = MultiAxisIndexKeyItem.slice(Slice())
 _IndexKey_1 = IndexKey.multi_axis(MultiAxisIndexKey.from_vec(Vec(MultiAxisIndexKeyItem.int(Int(0)), _MultiAxisIndexKeyItem_1)))
 _NDArray_5 = _NDArray_1[IndexKey.ndarray(_NDArray_2 == NDArray(RecursiveValue(Value.from_int(Int(0)))))]
@@ -33,14 +33,16 @@ _NDArray_8 = concat(TupleNDArray(Vec(_NDArray_5 - _NDArray_4[_IndexKey_1], _NDAr
 _NDArray_9 = square(_NDArray_8 - expand_dims(sum(_NDArray_8, OptionalIntOrTuple.int(Int(0))) / NDArray(RecursiveValue(Value.from_int(_NDArray_8.shape[Int(0)])))))
 _NDArray_10 = sqrt(sum(_NDArray_9, OptionalIntOrTuple.int(Int(0))) / NDArray(RecursiveValue(Value.from_int(_NDArray_9.shape[Int(0)]))))
 _NDArray_11 = copy(_NDArray_10)
-_NDArray_11[IndexKey.ndarray(_NDArray_10 == NDArray(RecursiveValue(Value.from_int(Int(0)))))] = NDArray(RecursiveValue(Value.from_int(Int(150)) / Value.from_int(Int(150))))
+_NDArray_11[IndexKey.ndarray(_NDArray_10 == NDArray(RecursiveValue(Value.from_int(Int(0)))))] = NDArray(
+    RecursiveValue(Value.from_float(Float.rational(BigRat(BigInt.from_string("1"), BigInt.from_string("1")))))
+)
 _TupleNDArray_1 = svd_(
     sqrt(
         asarray(
-            NDArray(RecursiveValue(Value.from_float(Float.rational(BigRat(BigInt.from_string("1"), BigInt.from_string("147")))))),
+            NDArray(RecursiveValue(Value.from_float(Float.rational(BigRat(BigInt.from_string("1"), BigInt.from_string("150")))))),
             OptionalDType.some(DType.float64),
             OptionalBool.none,
-            OptionalDevice.some(_NDArray_1.device),
+            OptionalDevice.some(Device.cpu),
         )
     )
     * (_NDArray_8 / _NDArray_11),

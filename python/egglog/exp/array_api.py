@@ -1527,7 +1527,10 @@ converter(Slice, IndexKey, lambda s: IndexKey.slice(s))
 converter(MultiAxisIndexKey, IndexKey, lambda m: IndexKey.multi_axis(m))
 
 
-class Device(Expr, ruleset=array_api_ruleset): ...
+class Device(Expr, ruleset=array_api_ruleset):
+    """Array device; the current CPU-only backend exposes ``Device.cpu``."""
+
+    cpu: ClassVar[Device]
 
 
 ALL_INDICES: TupleInt = constant("ALL_INDICES", TupleInt)
@@ -1766,8 +1769,10 @@ class NDArray(Expr, ruleset=array_api_ruleset):
     @property
     def dtype(self) -> DType: ...
 
+    @method(preserve=True)  # type: ignore[prop-decorator]
     @property
-    def device(self) -> Device: ...
+    def device(self) -> Device:
+        return Device.cpu
 
     @property
     def shape(self) -> TupleInt: ...
@@ -2379,7 +2384,8 @@ def vecdot(x1: NDArrayLike, x2: NDArrayLike) -> NDArray:
         x1.shape.drop_last(),
         x1.dtype,
         lambda idx: (
-            TupleInt.range(x1.shape.last())
+            TupleInt
+            .range(x1.shape.last())
             .map_value(lambda i: x1.index(idx.append(i)) * x2.index((i,)))
             .foldl_value(Value.__add__, Value.from_float(0))
         ),
@@ -2740,7 +2746,8 @@ def unravel_index(flat_index: IntLike, shape: TupleIntLike) -> TupleInt:
     shape = cast("TupleInt", shape)
 
     return (
-        shape.reverse()
+        shape
+        .reverse()
         .foldl_tuple_int(
             # Store remainder as last item in accumulator
             lambda acc, dim: acc.drop_last().append((r := acc.last()) % dim).append(r // dim),
@@ -2867,6 +2874,7 @@ def to_polynomial_ruleset(
         mss1 == mss.map(partial(multiset_flat_map, get_monomial)),
         mss != mss1,  # skip if this is a no-op
         name="unwrap monomial",
+        eval_mode="naive",
     ).then(
         union(n1).with_(polynomial(mss1)),
         delete(polynomial(mss)),
@@ -2878,6 +2886,7 @@ def to_polynomial_ruleset(
         mss1 == multiset_flat_map(UnstableFn(get_sole_polynomial), mss),
         mss != mss1,
         name="unwrap polynomial",
+        eval_mode="naive",
     ).then(
         union(n1).with_(polynomial(mss1)),
         delete(polynomial(mss)),

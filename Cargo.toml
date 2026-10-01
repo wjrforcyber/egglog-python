@@ -1,6 +1,6 @@
 [package]
 name = "egglog_python"
-version = "13.2.1+fixed.1"
+version = "14.0.0"
 edition = "2024"
 
 
@@ -9,61 +9,34 @@ edition = "2024"
 name = "egglog"
 crate-type = ["cdylib"]
 
-[features]
-# extension-module is default-on for wheels; `cargo test --no-default-features`
-# links libpython so Rust unit tests can run natively.
-default = ["extension-module"]
-extension-module = ["pyo3/extension-module"]
-
 [dependencies]
-pyo3 = { version = "0.27", features = ["num-bigint", "num-rational", "indexmap"] }
-num-bigint = "*"
+# Maturin enables `pyo3/extension-module` through pyproject.toml. Keep it out of
+# the base feature set so `cargo test` links against libpython on Unix.
+pyo3 = { version = "0.29", features = ["num-bigint", "num-rational", "indexmap"] }
 num-rational = "*"
 indexmap = "2.12"
-opentelemetry = "0.28"
-opentelemetry-otlp = { version = "0.28", features = ["http-proto", "reqwest-blocking-client", "trace"] }
-opentelemetry-stdout = { version = "0.28", features = ["trace"] }
-opentelemetry_sdk = "0.28"
-# egglog = { path = "../egg-smol", default-features = false }
-# egglog-bridge = { path = "../egg-smol/egglog-bridge" }
-# egglog-core-relations = { path = "../egg-smol/core-relations" }
-# egglog-ast = { path = "../egg-smol/egglog-ast" }
-# egglog-reports = { path = "../egg-smol/egglog-reports" }
-# eggverse: fix for the bulk-`let` e-graph corruption (SymbolGen::fresh minted
-# colliding internal names, conflating distinct globals during action
-# compilation). See ../../fixes/20260827_upstream_issue/README.md.
-# The patched core is vendored at ../egglog-fixed (egraphs-good/egglog
-# e264c37a + fix). Both patch tables below are required: patch redirects
-# cannot chain, so every referenced source must point at the local tree
-# directly.
-# NOTE (2026-09-14): bumping to upstream e5dea2d5 (where the fix landed as
-# #1006) was attempted and ABORTED: the core's extract rework replaced
-# `egglog::extract::Extractor` with `TreeExtractor<'g>` which borrows the
-# e-graph, and our pyo3 `bindings.Extractor` owns its prepared state across
-# calls — unportable without unsafe self-reference or an API break. Revisit
-# when upstream egglog-python rebases onto the new core.
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b", default-features = false }
-egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b" }
-egglog-core-relations = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b" }
-egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b" }
-egglog-bridge = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b" }
-egglog-experimental = { git = "https://github.com/egraphs-good/egglog-experimental", branch = "main", default-features = false }
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-blocking-client", "trace"] }
+opentelemetry-stdout = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = "0.32"
+egglog = { git = "https://github.com/egraphs-good/egglog", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05", default-features = false }
+egglog-ast = { git = "https://github.com/egraphs-good/egglog", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05" }
+egglog-core-relations = { git = "https://github.com/egraphs-good/egglog", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05" }
+egglog-reports = { git = "https://github.com/egraphs-good/egglog", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05" }
+egglog-bridge = { git = "https://github.com/egraphs-good/egglog", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05" }
+egglog-experimental = { git = "https://github.com/egraphs-good/egglog-experimental.git", rev = "3d35f37a4befbfa75608aa6998408334e19b6180", default-features = false }
 egraph-serialize = { version = "0.3", features = ["serde", "graphviz"] }
 serde_json = "1"
 pyo3-log =  "*"
 log = "0.4"
-lalrpop-util = { version = "0.22", features = ["lexer"] }
+lalrpop-util = { version = "0.23", features = ["lexer"] }
 ordered-float = "5"
 tracing = "0.1"
-tracing-opentelemetry = "0.29"
+tracing-opentelemetry = "0.33"
 tracing-subscriber = "0.3"
 uuid = { version = "1.18", features = ["v4"] }
-rayon = "1.11"
-base64 = "0.22.1"
+base64 = "0.23"
 
-[patch.'https://github.com/egraphs-good/egglog.git']
-egglog = { path = "../egglog-fixed" }
-egglog-ast = { path = "../egglog-fixed/egglog-ast" }
-egglog-core-relations = { path = "../egglog-fixed/core-relations" }
-egglog-bridge = { path = "../egglog-fixed/egglog-bridge" }
-egglog-reports = { path = "../egglog-fixed/egglog-reports" }
+# enable debug symbols for easier profiling
+[profile.release]
+debug = true
