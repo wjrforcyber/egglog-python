@@ -337,10 +337,10 @@ def test_cutmapper_delay_first_bookkeeping():
     egraph.register(e)
     it = _iter(egraph, [e])
     cells = [
-        ("and2", 2, EXPECTED_TT["and"], 3.0, 2.0),
-        ("or2", 2, EXPECTED_TT["or"], 2.0, 2.0),
-        ("inv", 1, EXPECTED_TT["not"], 1.0, 1.0),
-        ("mux2", 3, EXPECTED_TT["mux"], 4.0, 3.0),
+        ("and2", 2, EXPECTED_TT["and"], 3.0, 2.0, [], []),
+        ("or2", 2, EXPECTED_TT["or"], 2.0, 2.0, [], []),
+        ("inv", 1, EXPECTED_TT["not"], 1.0, 1.0, [], []),
+        ("mux2", 3, EXPECTED_TT["mux"], 4.0, 3.0, [], []),
     ]
     cm = bindings.CutMapper(it, cells, "delay")
     st = cm.stats
@@ -371,10 +371,10 @@ def test_cutmapper_area_vs_delay():
             break
     it = _iter(egraph, [e])
     cells = [
-        ("and2", 2, EXPECTED_TT["and"], 3.0, 2.0),
-        ("nand2", 2, EXPECTED_TT["nand"], 2.0, 1.5),
-        ("or2", 2, EXPECTED_TT["or"], 5.0, 1.0),
-        ("inv", 1, EXPECTED_TT["not"], 1.0, 1.0),
+        ("and2", 2, EXPECTED_TT["and"], 3.0, 2.0, [], []),
+        ("nand2", 2, EXPECTED_TT["nand"], 2.0, 1.5, [], []),
+        ("or2", 2, EXPECTED_TT["or"], 5.0, 1.0, [], []),
+        ("inv", 1, EXPECTED_TT["not"], 1.0, 1.0, [], []),
     ]
     cm_delay = bindings.CutMapper(it, cells, "delay")
     cm_area = bindings.CutMapper(it, cells, "area")

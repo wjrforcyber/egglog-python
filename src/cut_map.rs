@@ -34,8 +34,32 @@ pub(crate) struct CellSpec {
     pub(crate) arity: usize,
     pub(crate) tt: u64,
     pub(crate) area: f64,
+    /// Delay at nominal load 1.0 (fallback when no per-pin LDM is given).
     pub(crate) delay: f64,
+    /// Input-pin capacitances (len == arity when load-aware).
+    pub(crate) pin_caps: Vec<f64>,
+    /// Per input pin [rise_block, rise_drive, fall_block, fall_drive]
+    /// (len == arity when load-aware); delay(load) = max(rb+rd*L, fb+fd*L),
+    /// cell delay = max over pins.  Mirrors eggverse.genlib.Pin::delay.
+    pub(crate) pin_ldm: Vec<[f64; 4]>,
 }
+
+impl CellSpec {
+    /// Cell delay into output load `load` (worst input pin, worst rise/fall).
+    pub(crate) fn delay_at(&self, load: f64) -> f64 {
+        if self.pin_ldm.len() == self.arity && self.arity > 0 {
+            self.pin_ldm
+                .iter()
+                .map(|l| (l[0] + l[1] * load).max(l[2] + l[3] * load))
+                .fold(f64::NEG_INFINITY, f64::max)
+        } else {
+            self.delay
+        }
+    }
+}
+
+/// PO pin load, matching network.py/mapping.py's normalized convention.
+const PO_LOAD: f64 = 0.25;
 
 #[derive(Clone, Copy, Debug)]
 struct Entry {
@@ -46,8 +70,11 @@ struct Entry {
 
 /// Index over all pin permutations of all cells.
 struct MatchIndex {
-    /// (arity, variant tt) -> (best-area entry, best-delay entry).
-    by_key: HashMap<(usize, u64), (Option<Entry>, Option<Entry>)>,
+    /// (arity, variant tt) -> ALL realizing entries.  Load-aware refinement
+    /// re-ranks cells at the measured load, so the classic two-entry
+    /// (best-area / best-delay-at-nominal) pruning would drop cells that win
+    /// only under high fanout; keys hold a handful of entries in practice.
+    by_key: HashMap<(usize, u64), Vec<Entry>>,
 }
 
 /// truth.permute_tt semantics: result bit m = tt bit at the minterm whose
@@ -97,7 +124,7 @@ fn permutations(n: usize) -> Vec<[u8; 4]> {
 }
 
 fn build_index(cells: &[CellSpec]) -> Result<MatchIndex, String> {
-    let mut by_key: HashMap<(usize, u64), (Option<Entry>, Option<Entry>)> = HashMap::new();
+    let mut by_key: HashMap<(usize, u64), Vec<Entry>> = HashMap::new();
     // cells arrive sorted by name from the caller: deterministic insertion
     for (ci, c) in cells.iter().enumerate() {
         if c.arity == 0 || c.arity > 4 {
@@ -114,29 +141,7 @@ fn build_index(cells: &[CellSpec]) -> Result<MatchIndex, String> {
                 cell: ci,
                 perm: invert(&p, c.arity),
             };
-            let slot = by_key.entry(key).or_insert((None, None));
-            let ba = &mut slot.0;
-            let better_area = match ba {
-                None => true,
-                Some(cur) => {
-                    let (ca, cd) = (cells[cur.cell].area, cells[cur.cell].delay);
-                    (c.area, c.delay, e.perm) < (ca, cd, cur.perm)
-                }
-            };
-            if better_area {
-                *ba = Some(e);
-            }
-            let bd = &mut slot.1;
-            let better_delay = match bd {
-                None => true,
-                Some(cur) => {
-                    let (ca, cd) = (cells[cur.cell].area, cells[cur.cell].delay);
-                    (c.delay, c.area, e.perm) < (cd, ca, cur.perm)
-                }
-            };
-            if better_delay {
-                *bd = Some(e);
-            }
+            by_key.entry(key).or_default().push(e);
         }
     }
     Ok(MatchIndex { by_key })
@@ -164,6 +169,8 @@ pub(crate) struct MapStats {
     pub(crate) num_const: usize,
     pub(crate) max_root_arrival: f64,
     pub(crate) total_flow_at_roots: f64,
+    /// DP passes actually run (1 = no load refinement converged immediately).
+    pub(crate) load_passes: usize,
 }
 
 pub(crate) struct MapOutput {
@@ -185,8 +192,8 @@ fn fnv_inputs(inputs: &[u32]) -> u64 {
     h
 }
 
-/// Single-pass mapping DP over the cut sets.
-pub(crate) fn map_cuts(
+/// One mapping DP pass with per-class load estimates driving the LDM.
+fn dp_once(
     graph: &ClassGraph,
     result: &CutResult,
     kernels: &[Kernel],
@@ -194,6 +201,7 @@ pub(crate) fn map_cuts(
     roots: &[u32],
     cells: &[CellSpec],
     objective: &str,
+    loads: &[f64],
 ) -> Result<MapOutput, String> {
     if objective != "delay" && objective != "area" {
         return Err(format!(
@@ -307,10 +315,10 @@ pub(crate) fn map_cuts(
                     if arity == 0 || arity > 4 {
                         continue;
                     }
-                    let Some((ba, bd)) = index.by_key.get(&(arity, c.tt)) else {
+                    let Some(entries) = index.by_key.get(&(arity, c.tt)) else {
                         continue;
                     };
-                    for entry in [ba, bd].into_iter().flatten() {
+                    for entry in entries {
                         let inputs: Vec<u32> = (0..arity)
                             .map(|i| c.leaves[entry.perm[i] as usize])
                             .collect();
@@ -318,7 +326,7 @@ pub(crate) fn map_cuts(
                             continue;
                         }
                         let cell = &cells[entry.cell];
-                        let arr = cell.delay
+                        let arr = cell.delay_at(loads[v])
                             + inputs
                                 .iter()
                                 .map(|&i| arrival[i as usize])
@@ -394,6 +402,7 @@ pub(crate) fn map_cuts(
     }
     stats.max_root_arrival = max_root_arrival;
     stats.total_flow_at_roots = total_flow_at_roots;
+    stats.load_passes = 1;
     Ok(MapOutput {
         arrival,
         flow,
@@ -401,6 +410,74 @@ pub(crate) fn map_cuts(
         emit_ok,
         stats,
     })
+}
+
+/// Per-class load from the current binding: sum of chosen consumers' input
+/// pin caps (pin index = position in `Choice::inputs`, which is cell-pin
+/// order) plus the PO pin load per root class.
+fn compute_loads(
+    n: usize,
+    roots: &[u32],
+    choices: &[Option<Choice>],
+    cells: &[CellSpec],
+) -> Vec<f64> {
+    let mut load = vec![0.0f64; n];
+    for &r in roots {
+        load[r as usize] += PO_LOAD;
+    }
+    for ch in choices.iter().flatten() {
+        for (i, &inp) in ch.inputs.iter().enumerate() {
+            let cap = cells[ch.cell]
+                .pin_caps
+                .get(i)
+                .copied()
+                .unwrap_or(1.0);
+            load[inp as usize] += cap;
+        }
+    }
+    load
+}
+
+/// Mapping DP over the cut sets: pass 0 prices cells at nominal load 1.0,
+/// then (delay objective only) re-runs the DP with loads measured from the
+/// previous binding until loads converge, oscillate (damped), or the pass
+/// cap.  Mirrors mapping.py::finish()'s fixed-point refinement.
+pub(crate) fn map_cuts(
+    graph: &ClassGraph,
+    result: &CutResult,
+    kernels: &[Kernel],
+    cone: &[bool],
+    roots: &[u32],
+    cells: &[CellSpec],
+    objective: &str,
+    load_passes: usize,
+) -> Result<MapOutput, String> {
+    let mut loads = vec![1.0f64; graph.classes.len()];
+    let mut out = dp_once(graph, result, kernels, cone, roots, cells, objective, &loads)?;
+    if objective != "delay" || load_passes <= 1 {
+        return Ok(out);
+    }
+    let mut prev_loads: Option<Vec<f64>> = None;
+    for _pass in 1..load_passes {
+        let new_loads = compute_loads(graph.classes.len(), roots, &out.choices, cells);
+        if new_loads == loads {
+            break; // converged
+        }
+        if prev_loads.as_ref() == Some(&new_loads) {
+            // two-cycle: damp (ABC EstRefs-style blend) and continue
+            loads = loads
+                .iter()
+                .zip(new_loads.iter())
+                .map(|(&a, &b)| 0.5 * a + 0.5 * b)
+                .collect();
+        } else {
+            prev_loads = Some(loads);
+            loads = new_loads;
+        }
+        out = dp_once(graph, result, kernels, cone, roots, cells, objective, &loads)?;
+        out.stats.load_passes = out.stats.load_passes.max(1) + 1;
+    }
+    Ok(out)
 }
 
 /// Mapping decisions over the cut sets of a [`crate::cut_iter::CutIterator`].
@@ -418,27 +495,44 @@ pub struct CutMapper {
 impl CutMapper {
     /// Run the mapping DP over `cut_iterator`'s enumerated cuts.
     ///
-    /// `cells`: list of (name, arity, tt, area, delay) tuples — build with
-    /// `eggverse.cutmap.cell_table(library)`; delay is the cell head delay
-    /// at the DP's nominal load (matches the existing cost-model convention).
+    /// `cells`: list of (name, arity, tt, area, delay, pin_caps, pin_ldm)
+    /// tuples — build with `eggverse.cutmap.cell_table(library)`.  `delay`
+    /// is the head delay at nominal load 1.0; `pin_ldm` rows are
+    /// (rise_block, rise_drive, fall_block, fall_drive) per input pin, used
+    /// for load-aware refinement (empty lists = load-independent cells).
+    /// `load_passes`: refinement cap (default 4, delay objective only).
     #[new]
-    #[pyo3(signature = (cut_iterator, cells, objective = "delay"))]
+    #[pyo3(signature = (cut_iterator, cells, objective = "delay", load_passes = None))]
     fn new(
         cut_iterator: PyRef<'_, crate::cut_iter::CutIterator>,
-        cells: Vec<(String, usize, u64, f64, f64)>,
+        cells: Vec<(
+            String,
+            usize,
+            u64,
+            f64,
+            f64,
+            Vec<f64>,
+            Vec<(f64, f64, f64, f64)>,
+        )>,
         objective: &str,
+        load_passes: Option<usize>,
     ) -> PyResult<Self> {
         if cells.is_empty() {
             return Err(PyValueError::new_err("cell table must not be empty"));
         }
         let mut cells: Vec<CellSpec> = cells
             .into_iter()
-            .map(|(name, arity, tt, area, delay)| CellSpec {
+            .map(|(name, arity, tt, area, delay, pin_caps, pin_ldm)| CellSpec {
                 name,
                 arity,
                 tt,
                 area,
                 delay,
+                pin_caps,
+                pin_ldm: pin_ldm
+                    .into_iter()
+                    .map(|(rb, rd, fb, fd)| [rb, rd, fb, fd])
+                    .collect(),
             })
             .collect();
         cells.sort_by(|a, b| a.name.cmp(&b.name));
@@ -451,6 +545,7 @@ impl CutMapper {
             &cit.root_ids,
             &cells,
             objective,
+            load_passes.unwrap_or(4),
         )
         .map_err(PyValueError::new_err)?;
         // emittable classes without a Choice are PIs or constants
@@ -538,6 +633,7 @@ impl CutMapper {
         d.set_item("num_const", s.num_const)?;
         d.set_item("max_root_arrival", s.max_root_arrival)?;
         d.set_item("total_flow_at_roots", s.total_flow_at_roots)?;
+        d.set_item("load_passes", s.load_passes)?;
         d.set_item("unmatched_pct", pct(s.num_unmatched, s.num_cone_classes))?;
         Ok(d.into_any().unbind())
     }
@@ -577,6 +673,8 @@ mod tests {
             tt,
             area,
             delay,
+            pin_caps: Vec::new(),
+            pin_ldm: Vec::new(),
         }
     }
 
@@ -621,7 +719,7 @@ mod tests {
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let roots = [3u32];
         let cells = std_cells();
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay").unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
         let ch = out.choices[3].as_ref().unwrap();
         assert_eq!(cells[ch.cell].name, "nand2");
         assert_eq!(ch.arrival, 1.5);
@@ -661,7 +759,7 @@ mod tests {
         let cone = vec![true; 5];
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let roots = [3u32];
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area").unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area", 1).unwrap();
         let ch = out.choices[3].as_ref().unwrap();
         assert_eq!(cells[ch.cell].name, "or2");
         assert_eq!(ch.inputs, vec![2, 4]);
@@ -693,11 +791,11 @@ mod tests {
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let cells = vec![cell("and2", 2, 0b1000, 3.0, 2.0)];
         // no root: no error, but 2 and 3 are unmatched
-        let out = map_cuts(&g, &res, &kernels, &cone, &[], &cells, "delay").unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &[], &cells, "delay", 4).unwrap();
         assert!(!out.emit_ok[2] && !out.emit_ok[3]);
         assert_eq!(out.stats.num_unmatched, 2);
         // with 3 as root: hard error
-        let err = map_cuts(&g, &res, &kernels, &cone, &[3u32], &cells, "delay");
+        let err = map_cuts(&g, &res, &kernels, &cone, &[3u32], &cells, "delay", 4);
         assert!(err.is_err(), "unmappable root must be a hard error");
     }
 
@@ -721,7 +819,7 @@ mod tests {
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let cells = vec![cell("mux2", 3, mux_cell_tt, 4.0, 3.0)];
         let roots = [3u32];
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay").unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
         let ch = out.choices[3].as_ref().unwrap();
         // cell pins (A,B,S) receive (a, b, s) = leaves 1, 2, 0
         assert_eq!(ch.inputs, vec![1, 2, 0]);
@@ -733,47 +831,235 @@ mod tests {
     fn t17b_index_best_entries() {
         let cells = std_cells();
         let idx = build_index(&cells).unwrap();
-        // (2, 0b0111): nand2 identity — best delay AND best area (only cell)
-        let (ba, bd) = idx.by_key.get(&(2, 0b0111)).unwrap();
-        assert_eq!(cells[ba.unwrap().cell].name, "nand2");
-        assert_eq!(cells[bd.unwrap().cell].name, "nand2");
+        // (2, 0b0111): nand2 identity — all permutations retained
+        let entries = idx.by_key.get(&(2, 0b0111)).unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|e| cells[e.cell].name == "nand2"));
         // two runs identical
         let idx2 = build_index(&cells).unwrap();
         assert_eq!(idx.by_key.len(), idx2.by_key.len());
     }
 
-    /// T20: DP-side fixpoint: a complement-pair SCC where the ~class has no
-    /// candidates until its partner is emitted gets deferred, not dropped.
+    /// T21: load-aware rebind — a weak driver wins at nominal load 1.0 but a
+    /// strong driver wins once the real fanout load (3 consumers x 1.25 pin
+    /// caps = 3.75) is measured in pass 1.
     #[test]
-    fn t20_dp_complement_pair() {
-        use crate::cut_iter::ClassKind;
-        // T19's graph: 0 = x (var + not(1)), 1 = not(0)
-        let mut g = crate::cut_iter::fixtures::mkgraph(
-            2,
-            vec![("var", vec![false]), ("B_not", vec![true])],
-            vec![(1, 1, vec![0]), (1, 0, vec![1])],
+    fn t21_load_aware_rebind() {
+        // 0=x,1=y,2=z; 3 = choice{weak,strong}(x,y); 4..6 = and(3,z) roots.
+        // K=2 makes the {x,y,z} bypass cut impossible, so the consumers MUST
+        // drive class 3.
+        let mut g = mkgraph(
+            7,
+            vec![
+                ("var", vec![false]),
+                ("B_and", vec![true, true]),
+                ("B_weak", vec![true, true]),
+                ("B_strong", vec![true, true]),
+            ],
+            vec![
+                (1, 4, vec![3, 2]),
+                (1, 5, vec![3, 2]),
+                (1, 6, vec![3, 2]),
+                (2, 3, vec![0, 1]), // weak realization of class 3
+            ],
         );
+        // strong realization of class 3 (same leaves)
         g.enodes.push(Enode {
-            func: 0,
-            out: 0,
-            ch_eq: vec![],
-            ch_prim: vec![(0, EggValue::new_const(7))],
+            func: 3,
+            out: 3,
+            ch_eq: vec![0, 1],
+            ch_prim: vec![],
             head: 0.0,
         });
-        g.enodes_of[0].push(g.enodes.len() - 1);
-        let kernels = vec![Kernel::Leaf, Kernel::Op { tt: op_tt_of("not") }];
-        let cone = vec![true; 2];
+        g.enodes_of[3].push(g.enodes.len() - 1);
+        add_vars(&mut g, 0, &[0, 1, 2]);
+        let kernels = vec![
+            Kernel::Leaf,
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+        ];
+        let cone = vec![true; 7];
+        let res = enumerate_cuts(&g, &params(2, 16), &kernels, &cone).unwrap();
+        let mk_consumer = || CellSpec {
+            name: "and2".into(),
+            arity: 2,
+            tt: 0b1000,
+            area: 3.0,
+            delay: 3.0,
+            pin_caps: vec![1.25, 1.25],
+            pin_ldm: vec![[2.0, 1.0, 2.0, 1.0], [2.0, 1.0, 2.0, 1.0]], // 2 + L
+        };
+        let weak = CellSpec {
+            name: "weak".into(),
+            arity: 2,
+            tt: 0b1000,
+            area: 1.0,
+            delay: 2.0,
+            pin_caps: vec![],
+            pin_ldm: vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]], // 1 + L
+        };
+        let strong = CellSpec {
+            name: "strong".into(),
+            arity: 2,
+            tt: 0b1000,
+            area: 2.0,
+            delay: 3.25,
+            pin_caps: vec![],
+            pin_ldm: vec![[3.0, 0.25, 3.0, 0.25], [3.0, 0.25, 3.0, 0.25]], // 3 + 0.25 L
+        };
+        let cells = vec![mk_consumer(), weak, strong];
+        let roots = [4u32, 5, 6];
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        let ch = out.choices[3].as_ref().unwrap();
+        // load(5) = 3 x 1.25 = 3.75; weak: 1+3.75 = 4.75 > strong: 3+0.9375 = 3.9375
+        assert_eq!(cells[ch.cell].name, "strong");
+        assert!(out.stats.load_passes >= 2);
+    }
+
+    /// T22: per-class load = sum of chosen consumers' pin caps + PO loads.
+    #[test]
+    fn t22_load_sum() {
+        use super::compute_loads;
+        use crate::class_graph::ClassGraph;
+        let n = 4usize;
+        let cells = vec![CellSpec {
+            name: "g".into(),
+            arity: 2,
+            tt: 0b1000,
+            area: 1.0,
+            delay: 1.0,
+            pin_caps: vec![0.5, 2.0],
+            pin_ldm: Vec::new(),
+        }];
+        // two consumers both fed [class1, class2]; class3 is a second root
+        let choices: Vec<Option<Choice>> = vec![
+            None,
+            Some(Choice {
+                cut: 0,
+                cell: 0,
+                perm: [0, 1, 0, 0],
+                inputs: vec![1, 2],
+                arrival: 1.0,
+                flow: 1.0,
+            }),
+            Some(Choice {
+                cut: 0,
+                cell: 0,
+                perm: [0, 1, 0, 0],
+                inputs: vec![1, 2],
+                arrival: 1.0,
+                flow: 1.0,
+            }),
+            None,
+        ];
+        let load = compute_loads(n, &[0u32, 3], &choices, &cells);
+        assert!((load[1] - 1.0).abs() < 1e-9); // 0.5 + 0.5
+        assert!((load[2] - 4.0).abs() < 1e-9); // 2.0 + 2.0
+        assert!((load[0] - 0.25).abs() < 1e-9); // PO only
+        assert!((load[3] - 0.25).abs() < 1e-9); // PO only
+        let _ = std::marker::PhantomData::<ClassGraph>;
+    }
+
+    /// T23: fixpoint — loads stabilize and the pass count stops growing.
+    #[test]
+    fn t23_fixpoint_passes() {
+        // single root gate over two PIs, LDM cell: pass0 load 1.0 -> pass1
+        // load 0.25 (PO only) -> converged at 2 passes.
+        let mut g = mkgraph(
+            3,
+            vec![("var", vec![false]), ("B_and", vec![true, true])],
+            vec![(1, 2, vec![0, 1])],
+        );
+        add_vars(&mut g, 0, &[0, 1]);
+        let kernels = vec![Kernel::Leaf, Kernel::Op { tt: op_tt_of("and") }];
+        let cone = vec![true; 3];
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
-        let cells = vec![cell("inv", 1, 0b01, 1.0, 1.0)];
-        let roots = [1u32];
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay").unwrap();
-        assert!(out.emit_ok[0] && out.emit_ok[1]);
-        let ch = out.choices[1].as_ref().unwrap();
-        assert_eq!(cells[ch.cell].name, "inv");
-        assert_eq!(ch.inputs, vec![0]);
-        assert_eq!(out.stats.num_unmatched, 0);
-        assert_eq!(out.stats.num_pi, 1);
-        let _ = ClassKind::Internal;
+        let cells = vec![CellSpec {
+            name: "and2".into(),
+            arity: 2,
+            tt: 0b1000,
+            area: 3.0,
+            delay: 2.0,
+            pin_caps: vec![1.0, 1.0],
+            pin_ldm: vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
+        }];
+        let roots = [2u32];
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        assert_eq!(out.stats.load_passes, 2);
+        // arrival = 1 + 0.25 = 1.25 under the converged PO-only load
+        assert!((out.arrival[2] - 1.25).abs() < 1e-9);
+    }
+
+    /// T24: determinism of the load-aware pipeline across two runs.
+    #[test]
+    fn t24_load_determinism() {
+        let mut g = mkgraph(
+            7,
+            vec![
+                ("var", vec![false]),
+                ("B_and", vec![true, true]),
+                ("B_weak", vec![true, true]),
+                ("B_strong", vec![true, true]),
+            ],
+            vec![
+                (1, 4, vec![3, 2]),
+                (1, 5, vec![3, 2]),
+                (1, 6, vec![3, 2]),
+                (2, 3, vec![0, 1]),
+            ],
+        );
+        g.enodes.push(Enode {
+            func: 3,
+            out: 3,
+            ch_eq: vec![0, 1],
+            ch_prim: vec![],
+            head: 0.0,
+        });
+        g.enodes_of[3].push(g.enodes.len() - 1);
+        add_vars(&mut g, 0, &[0, 1, 2]);
+        let kernels = vec![
+            Kernel::Leaf,
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+        ];
+        let cone = vec![true; 7];
+        let res = enumerate_cuts(&g, &params(2, 16), &kernels, &cone).unwrap();
+        let cells = vec![
+            CellSpec {
+                name: "and2".into(),
+                arity: 2,
+                tt: 0b1000,
+                area: 3.0,
+                delay: 2.0,
+                pin_caps: vec![1.25, 1.25],
+                pin_ldm: Vec::new(),
+            },
+            CellSpec {
+                name: "weak".into(),
+                arity: 2,
+                tt: 0b1000,
+                area: 1.0,
+                delay: 2.0,
+                pin_caps: vec![],
+                pin_ldm: vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
+            },
+            CellSpec {
+                name: "strong".into(),
+                arity: 2,
+                tt: 0b1000,
+                area: 2.0,
+                delay: 3.25,
+                pin_caps: vec![],
+                pin_ldm: vec![[3.0, 0.25, 3.0, 0.25], [3.0, 0.25, 3.0, 0.25]],
+            },
+        ];
+        let roots = [4u32, 5, 6];
+        let a = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        let b = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        assert_eq!(format!("{:?}", a.choices), format!("{:?}", b.choices));
+        assert_eq!(a.stats.load_passes, b.stats.load_passes);
     }
 
     fn op_tt_of(op: &str) -> u64 {

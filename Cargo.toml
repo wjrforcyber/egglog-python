@@ -29,6 +29,19 @@ opentelemetry_sdk = "0.28"
 # egglog-core-relations = { path = "../egg-smol/core-relations" }
 # egglog-ast = { path = "../egg-smol/egglog-ast" }
 # egglog-reports = { path = "../egg-smol/egglog-reports" }
+# eggverse: fix for the bulk-`let` e-graph corruption (SymbolGen::fresh minted
+# colliding internal names, conflating distinct globals during action
+# compilation). See ../../fixes/20260827_upstream_issue/README.md.
+# The patched core is vendored at ../egglog-fixed (egraphs-good/egglog
+# e264c37a + fix). Both patch tables below are required: patch redirects
+# cannot chain, so every referenced source must point at the local tree
+# directly.
+# NOTE (2026-09-14): bumping to upstream e5dea2d5 (where the fix landed as
+# #1006) was attempted and ABORTED: the core's extract rework replaced
+# `egglog::extract::Extractor` with `TreeExtractor<'g>` which borrows the
+# e-graph, and our pyo3 `bindings.Extractor` owns its prepared state across
+# calls — unportable without unsafe self-reference or an API break. Revisit
+# when upstream egglog-python rebases onto the new core.
 egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b", default-features = false }
 egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b" }
 egglog-core-relations = { git = "https://github.com/egraphs-good/egglog.git", rev = "2e5657b" }
@@ -48,13 +61,6 @@ uuid = { version = "1.18", features = ["v4"] }
 rayon = "1.11"
 base64 = "0.22.1"
 
-# eggverse: fix for the bulk-`let` e-graph corruption (SymbolGen::fresh minted
-# colliding internal names, conflating distinct globals during action
-# compilation). See ../../fixes/20260827_upstream_issue/README.md.
-# The patched core is vendored at ../egglog-fixed (egraphs-good/egglog
-# e264c37a + fix). Both patch tables below are required: patch redirects
-# cannot chain, so every referenced source must point at the local tree
-# directly.
 [patch.'https://github.com/egraphs-good/egglog.git']
 egglog = { path = "../egglog-fixed" }
 egglog-ast = { path = "../egglog-fixed/egglog-ast" }
