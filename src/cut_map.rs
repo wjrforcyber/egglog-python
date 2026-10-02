@@ -193,6 +193,13 @@ fn fnv_inputs(inputs: &[u32]) -> u64 {
 }
 
 /// One mapping DP pass with per-class load estimates driving the LDM.
+///
+/// Selection: collect every (cut, cell-entry) candidate per class, then pick
+/// the winner.  Delay objective: candidates within `(1 + relax)` of the best
+/// arrival compete on area flow (ABC `&nf -R` analog; relax = 0 reproduces
+/// pure-delay behavior since ties on arrival then break on flow).  Area
+/// objective: plain (flow, arrival) ranking, unaffected by relax.
+#[allow(clippy::too_many_arguments)]
 fn dp_once(
     graph: &ClassGraph,
     result: &CutResult,
@@ -202,6 +209,7 @@ fn dp_once(
     cells: &[CellSpec],
     objective: &str,
     loads: &[f64],
+    relax: f64,
 ) -> Result<MapOutput, String> {
     if objective != "delay" && objective != "area" {
         return Err(format!(
@@ -282,31 +290,8 @@ fn dp_once(
                     ClassKind::Internal => {}
                 }
 
-                let mut best: Option<(f64, f64, u64, Choice)> = None;
-                let mut consider = |best: &mut Option<(f64, f64, u64, Choice)>,
-                                    arr: f64,
-                                    fl: f64,
-                                    ch: Choice| {
-                    let key = if delay_first {
-                        (arr, fl, fnv_inputs(&ch.inputs))
-                    } else {
-                        (fl, arr, fnv_inputs(&ch.inputs))
-                    };
-                    let replace = match best {
-                        None => true,
-                        Some((ba, bf, bh, _)) => {
-                            let cur_key = if delay_first {
-                                (*ba, *bf, *bh)
-                            } else {
-                                (*bf, *ba, *bh)
-                            };
-                            key < cur_key
-                        }
-                    };
-                    if replace {
-                        *best = Some((arr, fl, fnv_inputs(&ch.inputs), ch));
-                    }
-                };
+                // ---- collect all (cut, cell) candidates ----
+                let mut cands: Vec<(f64, f64, u64, Choice)> = Vec::new();
                 for (ci, c) in cuts[v].iter().enumerate() {
                     if c.realization.is_none() {
                         continue; // trivial cut: not cell-matchable
@@ -320,26 +305,26 @@ fn dp_once(
                     };
                     for entry in entries {
                         let inputs: Vec<u32> = (0..arity)
-                            .map(|i| c.leaves[entry.perm[i] as usize])
+                            .map(|j| c.leaves[entry.perm[j] as usize])
                             .collect();
-                        if inputs.iter().any(|&i| !emit_ok[i as usize]) {
+                        if inputs.iter().any(|&j| !emit_ok[j as usize]) {
                             continue;
                         }
                         let cell = &cells[entry.cell];
                         let arr = cell.delay_at(loads[v])
                             + inputs
                                 .iter()
-                                .map(|&i| arrival[i as usize])
+                                .map(|&j| arrival[j as usize])
                                 .fold(f64::NEG_INFINITY, f64::max);
                         let fl = cell.area
                             + inputs
                                 .iter()
-                                .map(|&i| flow[i as usize] / (refs[i as usize].max(1) as f64))
+                                .map(|&j| flow[j as usize] / (refs[j as usize].max(1) as f64))
                                 .sum::<f64>();
-                        consider(
-                            &mut best,
+                        cands.push((
                             arr,
                             fl,
+                            fnv_inputs(&inputs),
                             Choice {
                                 cut: ci,
                                 cell: entry.cell,
@@ -348,9 +333,33 @@ fn dp_once(
                                 arrival: arr,
                                 flow: fl,
                             },
-                        );
+                        ));
                     }
                 }
+
+                // ---- select: relaxed-window, deterministic ----
+                let best = if delay_first {
+                    let best_arr = cands.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
+                    let thr = if relax > 0.0 && best_arr.is_finite() {
+                        best_arr * (1.0 + relax)
+                    } else {
+                        best_arr
+                    };
+                    cands.into_iter()
+                        .filter(|c| c.0 <= thr)
+                        .min_by(|a, b| {
+                            // flow-first inside the relaxed window
+                            let ka = (a.1, a.0, a.2);
+                            let kb = (b.1, b.0, b.2);
+                            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                } else {
+                    cands.into_iter().min_by(|a, b| {
+                        let ka = (a.1, a.0, a.2);
+                        let kb = (b.1, b.0, b.2);
+                        ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                };
                 match best {
                     Some((arr, fl, _, ch)) => {
                         arrival[v] = arr;
@@ -438,6 +447,95 @@ fn compute_loads(
     load
 }
 
+/// Backward required times from the final binding: PO roots get
+/// `T * (1 + relax_req)` where T = best root arrival; each class's requirement
+/// is the min over its consumers of (consumer requirement - consumer cell
+/// delay at its load).  Complement-pair SCCs iterate to a bounded fixpoint.
+#[allow(clippy::too_many_arguments)]
+fn compute_required(
+    graph: &ClassGraph,
+    cone: &[bool],
+    roots: &[u32],
+    choices: &[Option<Choice>],
+    cells: &[CellSpec],
+    loads: &[f64],
+    relax_req: f64,
+    n: usize,
+) -> Vec<f64> {
+    let mut t = 0.0f64;
+    for &r in roots {
+        t = t.max(arrival_of(choices, r as usize));
+    }
+    let mut req = vec![f64::INFINITY; n];
+    for (v, ch) in choices.iter().enumerate() {
+        let _ = v;
+        let _ = ch;
+    }
+    for &r in roots {
+        let arr = arrival_of(choices, r as usize);
+        if arr.is_finite() {
+            req[r as usize] = arr * (1.0 + relax_req);
+        }
+    }
+    // consumers of c: every class w whose chosen inputs contain c at pin i;
+    // requirement contribution: req[w] - delay_at(loads[w]) of the chosen cell
+    let mut consumers: HashMap<u32, Vec<(u32, f64)>> = HashMap::new();
+    for (w, ch) in choices.iter().enumerate() {
+        if let Some(ch) = ch {
+            let d = cells[ch.cell].delay_at(loads[w]);
+            for &inp in &ch.inputs {
+                consumers.entry(inp).or_default().push((w as u32, d));
+            }
+        }
+    }
+    // relax over parents (reverse of children-first = sccs reversed)
+    for comp in graph.sccs.iter().rev() {
+        let scc_pos: HashMap<u32, usize> =
+            comp.iter().enumerate().map(|(i, &cv)| (cv, i)).collect();
+        let mut done = vec![false; comp.len()];
+        for _pass in 0..=comp.len() {
+            let mut progress = false;
+            for i in 0..comp.len() {
+                if done[i] {
+                    continue;
+                }
+                let v = comp[i] as usize;
+                if !cone[v] {
+                    done[i] = true;
+                    continue;
+                }
+                let mut r = req[v];
+                if let Some(cs) = consumers.get(&comp[i]) {
+                    for (w, d) in cs {
+                        let rw = req[*w as usize];
+                        if rw.is_finite() {
+                            let cand = rw - d;
+                            if cand < r {
+                                r = cand;
+                            }
+                        }
+                    }
+                }
+                if r != req[v] {
+                    req[v] = r;
+                    progress = true;
+                }
+                done[i] = true; // single sweep converges: parents-first order
+                progress = true;
+            }
+            let _ = &scc_pos;
+            if !progress {
+                break;
+            }
+        }
+    }
+    req
+}
+
+fn arrival_of(choices: &[Option<Choice>], v: usize) -> f64 {
+    choices[v].as_ref().map(|c| c.arrival).unwrap_or(f64::INFINITY)
+}
+
 /// Mapping DP over the cut sets: pass 0 prices cells at nominal load 1.0,
 /// then (delay objective only) re-runs the DP with loads measured from the
 /// previous binding until loads converge, oscillate (damped), or the pass
@@ -451,33 +549,244 @@ pub(crate) fn map_cuts(
     cells: &[CellSpec],
     objective: &str,
     load_passes: usize,
+    relax: f64,
 ) -> Result<MapOutput, String> {
     let mut loads = vec![1.0f64; graph.classes.len()];
-    let mut out = dp_once(graph, result, kernels, cone, roots, cells, objective, &loads)?;
-    if objective != "delay" || load_passes <= 1 {
+    let mut out = dp_once(graph, result, kernels, cone, roots, cells, objective, &loads, 0.0)?;
+    if objective == "delay" && load_passes > 1 {
+        let mut prev_loads: Option<Vec<f64>> = None;
+        for _pass in 1..load_passes {
+            let new_loads = compute_loads(graph.classes.len(), roots, &out.choices, cells);
+            if new_loads == loads {
+                break; // converged
+            }
+            if prev_loads.as_ref() == Some(&new_loads) {
+                // two-cycle: damp (ABC EstRefs-style blend) and continue
+                loads = loads
+                    .iter()
+                    .zip(new_loads.iter())
+                    .map(|(&a, &b)| 0.5 * a + 0.5 * b)
+                    .collect();
+            } else {
+                prev_loads = Some(loads);
+                loads = new_loads;
+            }
+            out = dp_once(graph, result, kernels, cone, roots, cells, objective, &loads, 0.0)?;
+            out.stats.load_passes = out.stats.load_passes.max(1) + 1;
+        }
+    }
+    if objective != "delay" {
         return Ok(out);
     }
-    let mut prev_loads: Option<Vec<f64>> = None;
-    for _pass in 1..load_passes {
-        let new_loads = compute_loads(graph.classes.len(), roots, &out.choices, cells);
-        if new_loads == loads {
-            break; // converged
+    // ---- required-time area recovery (ABC &nf architecture) ----
+    // Backward required times from the current binding (root deadline relaxed
+    // by `relax`), then re-select every class flow-first among candidates
+    // meeting its requirement.  Because children re-select too, one pass
+    // double-spends slack; ABC iterates (nIterFlow) until the binding stops
+    // changing, so arrivals and requirements converge to a consistent state.
+    let mut cur = out;
+    for _iter in 0..4 {
+        let req = compute_required(graph, cone, roots, &cur.choices, cells, &loads, relax, graph.classes.len());
+        let next = dp_required_flow(graph, result, kernels, cone, roots, cells, &loads, &req, &cur)?;
+        let changed = signature(&cur.choices) != signature(&next.choices);
+        cur = next;
+        if !changed {
+            break;
         }
-        if prev_loads.as_ref() == Some(&new_loads) {
-            // two-cycle: damp (ABC EstRefs-style blend) and continue
-            loads = loads
-                .iter()
-                .zip(new_loads.iter())
-                .map(|(&a, &b)| 0.5 * a + 0.5 * b)
-                .collect();
-        } else {
-            prev_loads = Some(loads);
-            loads = new_loads;
-        }
-        out = dp_once(graph, result, kernels, cone, roots, cells, objective, &loads)?;
-        out.stats.load_passes = out.stats.load_passes.max(1) + 1;
     }
-    Ok(out)
+    Ok(cur)
+}
+
+/// Binding signature: chosen (cell, inputs, cut) per mapped class — the
+/// fixed-point test for the required-time iterations.
+fn signature(choices: &[Option<Choice>]) -> Vec<Option<(usize, usize, Vec<u32>)>> {
+    choices
+        .iter()
+        .map(|c| {
+            c.as_ref()
+                .map(|ch| (ch.cell, ch.cut, ch.inputs.clone()))
+        })
+        .collect()
+}
+
+/// Required-time re-selection: forward sweep (same SCC fixpoint shape) where
+/// a candidate is eligible iff its arrival (children's pass-1 arrivals) meets
+/// the class requirement; eligible candidates compete on area flow.
+#[allow(clippy::too_many_arguments)]
+fn dp_required_flow(
+    graph: &ClassGraph,
+    result: &CutResult,
+    kernels: &[Kernel],
+    cone: &[bool],
+    roots: &[u32],
+    cells: &[CellSpec],
+    loads: &[f64],
+    req: &[f64],
+    base: &MapOutput,
+) -> Result<MapOutput, String> {
+    let index = build_index(cells)?;
+    let n = graph.classes.len();
+    let cuts = &result.cuts;
+
+    let mut refs = vec![0u32; n];
+    for (v, ok) in cone.iter().enumerate() {
+        if *ok {
+            for &ei in &graph.enodes_of[v] {
+                for &c in &graph.enodes[ei].ch_eq {
+                    refs[c as usize] += 1;
+                }
+            }
+        }
+    }
+
+    // CURRENT arrivals/flows: children re-select before parents (children-
+    // first SCC order), so eligibility must price candidates against the
+    // up-to-date child arrivals, not the frozen pass-1 ones — otherwise
+    // slack is double-spent down the cone and the deadline is missed.
+    let mut cur_arrival = base.arrival.clone();
+    let mut flow = vec![f64::INFINITY; n];
+    let mut choices: Vec<Option<Choice>> = vec![None; n];
+    let mut emit_ok = vec![false; n];
+    let mut stats = base.stats.clone();
+
+    for (si, comp) in graph.sccs.iter().enumerate() {
+        let scc_pos: HashMap<u32, usize> =
+            comp.iter().enumerate().map(|(i, &cv)| (cv, i)).collect();
+        let mut done: Vec<bool> = vec![false; comp.len()];
+        for _pass in 0..=comp.len() {
+            let mut progress = false;
+            for i in 0..comp.len() {
+                if done[i] {
+                    continue;
+                }
+                let cv = comp[i];
+                let v = cv as usize;
+                if !cone[v] {
+                    done[i] = true;
+                    continue;
+                }
+                let kind = class_kind(graph, kernels, v).map_err(|e| e.to_string())?;
+                match kind {
+                    ClassKind::Pi | ClassKind::Const(_) => {
+                        flow[v] = 0.0;
+                        emit_ok[v] = true;
+                        done[i] = true;
+                        progress = true;
+                        continue;
+                    }
+                    ClassKind::Internal => {}
+                }
+                let requirement = req[v];
+                let mut best: Option<(f64, f64, u64, Choice)> = None;
+                for (ci, c) in cuts[v].iter().enumerate() {
+                    if c.realization.is_none() {
+                        continue;
+                    }
+                    let arity = c.leaves.len();
+                    if arity == 0 || arity > 4 {
+                        continue;
+                    }
+                    let Some(entries) = index.by_key.get(&(arity, c.tt)) else {
+                        continue;
+                    };
+                    for entry in entries {
+                        let inputs: Vec<u32> = (0..arity)
+                            .map(|j| c.leaves[entry.perm[j] as usize])
+                            .collect();
+                        if inputs.iter().any(|&j| !emit_ok[j as usize]) {
+                            continue;
+                        }
+                        let cell = &cells[entry.cell];
+                        let arr = cell.delay_at(loads[v])
+                            + inputs
+                                .iter()
+                                .map(|&j| cur_arrival[j as usize])
+                                .fold(f64::NEG_INFINITY, f64::max);
+                        if !(arr <= requirement + 1e-9) {
+                            continue; // misses its required time
+                        }
+                        let fl = cell.area
+                            + inputs
+                                .iter()
+                                .map(|&j| flow[j as usize] / (refs[j as usize].max(1) as f64))
+                                .sum::<f64>();
+                        let key = (fl, arr, fnv_inputs(&inputs));
+                        let better = match &best {
+                            None => true,
+                            Some((_, _, bk, _)) => {
+                                let kb = (best.as_ref().unwrap().1,
+                                          best.as_ref().unwrap().0,
+                                          *bk);
+                                key < kb
+                            }
+                        };
+                        if better {
+                            best = Some((arr, fl, fnv_inputs(&inputs), Choice {
+                                cut: ci,
+                                cell: entry.cell,
+                                perm: entry.perm,
+                                inputs,
+                                arrival: arr,
+                                flow: fl,
+                            }));
+                        }
+                    }
+                }
+                if let Some((arr, fl, _, ch)) = best {
+                    cur_arrival[v] = arr;
+                    flow[v] = fl;
+                    choices[v] = Some(ch);
+                    emit_ok[v] = true;
+                    done[i] = true;
+                    progress = true;
+                } else if !base.emit_ok[v] {
+                    done[i] = true; // was unmatched in pass 1 too
+                } else {
+                    // no candidate meets req[] under CURRENT child arrivals:
+                    // keep the pass-1 choice and its actual arrival (sound
+                    // degradation; the next fixpoint iteration tightens req)
+                    cur_arrival[v] = base.arrival[v];
+                    flow[v] = base.flow[v];
+                    choices[v] = base.choices[v].clone();
+                    emit_ok[v] = true;
+                    done[i] = true;
+                    progress = true;
+                }
+            }
+            let _ = scc_pos;
+            if !progress {
+                break;
+            }
+        }
+    }
+
+    // propagate flows upward once more for coherent root flow reporting
+    let mut max_root_arrival = 0.0f64;
+    let mut total_flow_at_roots = 0.0f64;
+    for &r in roots {
+        let r = r as usize;
+        if !emit_ok[r] {
+            let bad = roots.iter().filter(|&&x| !emit_ok[x as usize]).count();
+            return Err(format!(
+                "cut-map: {bad} of {} root classes are unmappable with this \
+                 library/K (unmatched classes: {}); raise K/max_cuts or use \
+                 the hybrid mapper",
+                roots.len(),
+                stats.num_unmatched
+            ));
+        }
+        max_root_arrival = max_root_arrival.max(cur_arrival[r]);
+        total_flow_at_roots += flow[r];
+    }
+    stats.max_root_arrival = max_root_arrival;
+    stats.total_flow_at_roots = total_flow_at_roots;
+    Ok(MapOutput {
+        arrival: cur_arrival,
+        flow,
+        choices,
+        emit_ok,
+        stats,
+    })
 }
 
 /// Mapping decisions over the cut sets of a [`crate::cut_iter::CutIterator`].
@@ -501,8 +810,11 @@ impl CutMapper {
     /// (rise_block, rise_drive, fall_block, fall_drive) per input pin, used
     /// for load-aware refinement (empty lists = load-independent cells).
     /// `load_passes`: refinement cap (default 4, delay objective only).
+    /// `relax`: delay-relaxation ratio R (default 0): delay-objective
+    /// candidates within (1+R) of the best arrival compete on area flow
+    /// (ABC `&nf -R` analog; 0 = pure delay, large = near-area).
     #[new]
-    #[pyo3(signature = (cut_iterator, cells, objective = "delay", load_passes = None))]
+    #[pyo3(signature = (cut_iterator, cells, objective = "delay", load_passes = None, relax = 0.0))]
     fn new(
         cut_iterator: PyRef<'_, crate::cut_iter::CutIterator>,
         cells: Vec<(
@@ -516,6 +828,7 @@ impl CutMapper {
         )>,
         objective: &str,
         load_passes: Option<usize>,
+        relax: f64,
     ) -> PyResult<Self> {
         if cells.is_empty() {
             return Err(PyValueError::new_err("cell table must not be empty"));
@@ -546,6 +859,7 @@ impl CutMapper {
             &cells,
             objective,
             load_passes.unwrap_or(4),
+            relax,
         )
         .map_err(PyValueError::new_err)?;
         // emittable classes without a Choice are PIs or constants
@@ -719,7 +1033,7 @@ mod tests {
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let roots = [3u32];
         let cells = std_cells();
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.0).unwrap();
         let ch = out.choices[3].as_ref().unwrap();
         assert_eq!(cells[ch.cell].name, "nand2");
         assert_eq!(ch.arrival, 1.5);
@@ -759,7 +1073,7 @@ mod tests {
         let cone = vec![true; 5];
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let roots = [3u32];
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area", 1).unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area", 1, 0.0).unwrap();
         let ch = out.choices[3].as_ref().unwrap();
         assert_eq!(cells[ch.cell].name, "or2");
         assert_eq!(ch.inputs, vec![2, 4]);
@@ -791,11 +1105,11 @@ mod tests {
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let cells = vec![cell("and2", 2, 0b1000, 3.0, 2.0)];
         // no root: no error, but 2 and 3 are unmatched
-        let out = map_cuts(&g, &res, &kernels, &cone, &[], &cells, "delay", 4).unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &[], &cells, "delay", 4, 0.0).unwrap();
         assert!(!out.emit_ok[2] && !out.emit_ok[3]);
         assert_eq!(out.stats.num_unmatched, 2);
         // with 3 as root: hard error
-        let err = map_cuts(&g, &res, &kernels, &cone, &[3u32], &cells, "delay", 4);
+        let err = map_cuts(&g, &res, &kernels, &cone, &[3u32], &cells, "delay", 4, 0.0);
         assert!(err.is_err(), "unmappable root must be a hard error");
     }
 
@@ -819,7 +1133,7 @@ mod tests {
         let res = enumerate_cuts(&g, &params(4, 16), &kernels, &cone).unwrap();
         let cells = vec![cell("mux2", 3, mux_cell_tt, 4.0, 3.0)];
         let roots = [3u32];
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.0).unwrap();
         let ch = out.choices[3].as_ref().unwrap();
         // cell pins (A,B,S) receive (a, b, s) = leaves 1, 2, 0
         assert_eq!(ch.inputs, vec![1, 2, 0]);
@@ -910,7 +1224,7 @@ mod tests {
         };
         let cells = vec![mk_consumer(), weak, strong];
         let roots = [4u32, 5, 6];
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.0).unwrap();
         let ch = out.choices[3].as_ref().unwrap();
         // load(5) = 3 x 1.25 = 3.75; weak: 1+3.75 = 4.75 > strong: 3+0.9375 = 3.9375
         assert_eq!(cells[ch.cell].name, "strong");
@@ -985,7 +1299,7 @@ mod tests {
             pin_ldm: vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
         }];
         let roots = [2u32];
-        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.0).unwrap();
         assert_eq!(out.stats.load_passes, 2);
         // arrival = 1 + 0.25 = 1.25 under the converged PO-only load
         assert!((out.arrival[2] - 1.25).abs() < 1e-9);
@@ -1056,10 +1370,141 @@ mod tests {
             },
         ];
         let roots = [4u32, 5, 6];
-        let a = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
-        let b = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4).unwrap();
+        let a = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.0).unwrap();
+        let b = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.0).unwrap();
         assert_eq!(format!("{:?}", a.choices), format!("{:?}", b.choices));
         assert_eq!(a.stats.load_passes, b.stats.load_passes);
+    }
+
+    /// T26: relaxation — with R large enough to admit a slower-but-smaller
+    /// candidate, the flow-first selection flips away from the pure-delay pick.
+    #[test]
+    fn t26_relax_flips_to_area() {
+        // T21's forced-consumption topology; weak(1+L, area 1) vs
+        // strong(3+0.25L, area 2): at load 0.25 weak is faster (1.25 < 3.0625)
+        // so pure delay picks weak; with relax = 2.0 both are eligible
+        // (3.0625 <= 1.25 * 3) and flow-first picks the smaller weak? — no:
+        // weak has SMALLER area.  Use strong area 0.5 to make the flip visible.
+        let mut g = mkgraph(
+            7,
+            vec![
+                ("var", vec![false]),
+                ("B_and", vec![true, true]),
+                ("B_weak", vec![true, true]),
+                ("B_strong", vec![true, true]),
+            ],
+            vec![
+                (1, 4, vec![3, 2]),
+                (1, 5, vec![3, 2]),
+                (1, 6, vec![3, 2]),
+                (2, 3, vec![0, 1]),
+            ],
+        );
+        g.enodes.push(Enode {
+            func: 3,
+            out: 3,
+            ch_eq: vec![0, 1],
+            ch_prim: vec![],
+            head: 0.0,
+        });
+        g.enodes_of[3].push(g.enodes.len() - 1);
+        add_vars(&mut g, 0, &[0, 1, 2]);
+        let kernels = vec![
+            Kernel::Leaf,
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+        ];
+        let cone = vec![true; 7];
+        let res = enumerate_cuts(&g, &params(2, 16), &kernels, &cone).unwrap();
+        let mk = |name: &str, area: f64, block: f64, drive: f64| CellSpec {
+            name: name.into(),
+            arity: 2,
+            tt: 0b1000,
+            area,
+            delay: block + drive,
+            pin_caps: vec![],
+            pin_ldm: vec![[block, drive, block, drive], [block, drive, block, drive]],
+        };
+        let cells = vec![
+            mk("consumer", 9.0, 2.0, 1.0),           // delay 3 at load 1
+            mk("weak", 4.0, 1.0, 1.0),                // fast & big area
+            mk("strong", 1.0, 3.0, 0.25),             // slow & tiny area
+        ];
+        let roots = [4u32, 5, 6];
+        // R=0: pure delay at load 0.25 -> weak (1.25 < 3.0625)
+        let out0 = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 1, 0.0).unwrap();
+        assert_eq!(cells[out0.choices[3].as_ref().unwrap().cell].name, "weak");
+        // R=2.0: strong (3.0625) is within 1.25*3 = 3.75 -> flow-first -> strong
+        let out2 = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 1, 2.0).unwrap();
+        assert_eq!(cells[out2.choices[3].as_ref().unwrap().cell].name, "strong");
+        // R=0 pure-delay arrival: load stays 1.0 with one pass -> weak 1+1
+        assert!((out0.arrival[3] - 2.0).abs() < 1e-9);
+    }
+
+    /// T27: relaxation is deterministic across reruns.
+    #[test]
+    fn t27_relax_determinism() {
+        let mut g = mkgraph(
+            7,
+            vec![
+                ("var", vec![false]),
+                ("B_and", vec![true, true]),
+                ("B_weak", vec![true, true]),
+                ("B_strong", vec![true, true]),
+            ],
+            vec![
+                (1, 4, vec![3, 2]),
+                (1, 5, vec![3, 2]),
+                (1, 6, vec![3, 2]),
+                (2, 3, vec![0, 1]),
+            ],
+        );
+        g.enodes.push(Enode {
+            func: 3,
+            out: 3,
+            ch_eq: vec![0, 1],
+            ch_prim: vec![],
+            head: 0.0,
+        });
+        g.enodes_of[3].push(g.enodes.len() - 1);
+        add_vars(&mut g, 0, &[0, 1, 2]);
+        let kernels = vec![
+            Kernel::Leaf,
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+            Kernel::Op { tt: op_tt_of("and") },
+        ];
+        let cone = vec![true; 7];
+        let res = enumerate_cuts(&g, &params(2, 16), &kernels, &cone).unwrap();
+        let cells = vec![
+            CellSpec { name: "consumer".into(), arity: 2, tt: 0b1000, area: 9.0, delay: 3.0, pin_caps: vec![], pin_ldm: vec![[2.0, 1.0, 2.0, 1.0], [2.0, 1.0, 2.0, 1.0]] },
+            CellSpec { name: "weak".into(), arity: 2, tt: 0b1000, area: 4.0, delay: 2.0, pin_caps: vec![], pin_ldm: vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]] },
+            CellSpec { name: "strong".into(), arity: 2, tt: 0b1000, area: 1.0, delay: 3.25, pin_caps: vec![], pin_ldm: vec![[3.0, 0.25, 3.0, 0.25], [3.0, 0.25, 3.0, 0.25]] },
+        ];
+        let roots = [4u32, 5, 6];
+        let a = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.1).unwrap();
+        let b = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 4, 0.1).unwrap();
+        assert_eq!(format!("{:?}", a.choices), format!("{:?}", b.choices));
+    }
+
+    /// T28: area objective ignores relax entirely.
+    #[test]
+    fn t28_area_ignores_relax() {
+        let mut g = mkgraph(
+            3,
+            vec![("var", vec![false]), ("B_and", vec![true, true])],
+            vec![(1, 2, vec![0, 1])],
+        );
+        add_vars(&mut g, 0, &[0, 1]);
+        let kernels = vec![Kernel::Leaf, Kernel::Op { tt: op_tt_of("and") }];
+        let cone = vec![true; 3];
+        let res = enumerate_cuts(&g, &params(2, 16), &kernels, &cone).unwrap();
+        let cells = vec![CellSpec { name: "and2".into(), arity: 2, tt: 0b1000, area: 3.0, delay: 2.0, pin_caps: vec![], pin_ldm: vec![] }];
+        let roots = [2u32];
+        let a = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area", 1, 0.0).unwrap();
+        let b = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area", 1, 5.0).unwrap();
+        assert_eq!(format!("{:?}", a.choices), format!("{:?}", b.choices));
     }
 
     fn op_tt_of(op: &str) -> u64 {
