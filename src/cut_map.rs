@@ -659,7 +659,7 @@ mod tests {
                 func: var_func,
                 out: c as u32,
                 ch_eq: vec![],
-                ch_prim: vec![(0, EggValue::new_const(j as u32 + 100))],
+                ch_prim: vec![(0, format!("n{}", j + 100))],
                 head: 0.0,
             });
             g.enodes_of[c].push(g.enodes.len() - 1);

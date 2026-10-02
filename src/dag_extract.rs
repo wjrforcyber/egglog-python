@@ -55,6 +55,8 @@ fn fnv_mix_u64(mut h: u64, w: u64) -> u64 {
 #[pyclass(unsendable)]
 pub struct DagExtractor {
     graph: ClassGraph,
+    /// Pre-resolved roots: value -> class index (fast per-PO lookups).
+    roots_map: HashMap<egglog::Value, u32>,
     costs: Vec<f64>,
     best: Vec<Option<usize>>,
     /// Persistent reconstruction memo (class idx -> TermId), shared by all
@@ -84,7 +86,7 @@ impl DagExtractor {
     /// Mirrors eggverse's Python cost models: a head cost of exactly 0 makes
     /// the enode cost 0 regardless of children (constants / variables).
     #[new]
-    #[pyo3(signature = (egraph, sort, head_costs, fold="sum", eps=0.0, noise_scale=1e-7, profile_sccs=false))]
+    #[pyo3(signature = (egraph, sort, head_costs, fold="sum", eps=0.0, noise_scale=1e-7, profile_sccs=false, roots=Vec::<Value>::new()))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         egraph: &EGraph,
@@ -94,6 +96,7 @@ impl DagExtractor {
         eps: f64,
         noise_scale: f64,
         profile_sccs: bool,
+        roots: Vec<Value>,
     ) -> PyResult<Self> {
         let fold_max = match fold {
             "sum" => false,
@@ -104,7 +107,13 @@ impl DagExtractor {
                 )))
             }
         };
-        let graph = ClassGraph::build(&egraph.egraph, &sort, &head_costs)?;
+        let root_values: Vec<egglog::Value> = roots.iter().map(|v| v.0).collect();
+        let (graph, root_ids) = ClassGraph::build(&egraph.egraph, &sort, &head_costs, &root_values)?;
+        let roots_map: HashMap<egglog::Value, u32> = roots
+            .iter()
+            .zip(root_ids.iter())
+            .map(|(v, &c)| (v.0, c))
+            .collect();
         let n = graph.classes.len();
 
         // ---- levelized DP over SCCs (children-first order) ----
@@ -123,10 +132,7 @@ impl DagExtractor {
                 }
                 for (pos, v) in &e.ch_prim {
                     h = fnv_mix_u64(h, *pos as u64);
-                    let mut hs = std::collections::hash_map::DefaultHasher::new();
-                    use std::hash::{Hash, Hasher};
-                    v.hash(&mut hs);
-                    h = fnv_mix_u64(h, hs.finish());
+                    h = fnv_bytes(h, v.as_bytes());
                 }
                 h
             };
@@ -249,6 +255,7 @@ impl DagExtractor {
 
         Ok(DagExtractor {
             graph,
+            roots_map,
             costs,
             best,
             memo: HashMap::default(),
@@ -267,13 +274,7 @@ impl DagExtractor {
         sort: String,
     ) -> PyResult<(f64, TermId)> {
         let eg = &egraph.egraph;
-        let root = eg
-            .get_sort_by_name(&sort)
-            .ok_or_else(|| PyValueError::new_err(format!("Unknown sort {sort}")))?;
-        let canonical = eg.get_canonical_value(value.0, root);
-        let Some(&idx) = self.graph.class_index.get(&canonical) else {
-            return Err(PyValueError::new_err("Unextractable root"));
-        };
+        let idx = self.resolve_class(eg, value.0, &sort)?;
         let cost = self.costs[idx as usize];
         if !cost.is_finite() {
             return Err(PyValueError::new_err("Unextractable root"));
@@ -303,6 +304,39 @@ impl DagExtractor {
 }
 
 impl DagExtractor {
+    /// Class index of `value`: pre-resolved roots first, else a single-root
+    /// serialize (correct but heavy; toy-scale only).
+    fn resolve_class(
+        &self,
+        eg: &egglog::EGraph,
+        value: egglog::Value,
+        sort: &str,
+    ) -> PyResult<u32> {
+        if let Some(&c) = self.roots_map.get(&value) {
+            return Ok(c);
+        }
+        let root = eg
+            .get_sort_by_name(sort)
+            .ok_or_else(|| PyValueError::new_err(format!("Unknown sort {sort}")))?;
+        let config = egglog::SerializeConfig {
+            max_functions: None,
+            max_calls_per_function: None,
+            include_temporary_functions: false,
+            root_eclasses: vec![(root.clone(), value)],
+        };
+        let cid = eg
+            .serialize(config)
+            .egraph
+            .root_eclasses
+            .into_iter()
+            .next()
+            .map(|c| c.to_string())
+            .ok_or_else(|| PyValueError::new_err("Unextractable root"))?;
+        self.graph.class_index.get(&cid).copied().ok_or_else(|| {
+            PyValueError::new_err("Unextractable root: class outside the whitelisted graph")
+        })
+    }
+
     /// Iterative post-order reconstruction of the minimum term for `idx`,
     /// memoized across calls.  Each completed subtree pushes exactly one
     /// TermId onto `results`; a `Build` frame pops exactly its eq-child
@@ -359,10 +393,9 @@ impl DagExtractor {
                                 };
                                 to_enter.push(c);
                             } else {
-                                let Some(&(_, pv)) = prim_iter.next() else {
+                                let Some((_, s)) = prim_iter.next().cloned() else {
                                     return Err(PyValueError::new_err("corrupt enode"));
                                 };
-                                let s: String = eg.value_to_base::<egglog::sort::S>(pv).0;
                                 slots[pos] = Some(termdag.0.lit(Literal::String(s)));
                             }
                         }

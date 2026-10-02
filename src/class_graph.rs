@@ -15,7 +15,6 @@ use std::collections::HashMap;
 
 use pyo3::{exceptions::PyValueError, prelude::*};
 
-use egglog::Value as EggValue;
 
 pub(crate) const UNSUPPORTED: &str =
     "DagExtractor supports a single eq-sort root, whitelisted constructors, and String primitives only";
@@ -37,7 +36,7 @@ pub(crate) struct Enode {
     /// Class indices of eq children (in eq-position order).
     pub(crate) ch_eq: Vec<u32>,
     /// (position, value) of primitive (String) children.
-    pub(crate) ch_prim: Vec<(u32, EggValue)>,
+    pub(crate) ch_prim: Vec<(u32, String)>,
     pub(crate) head: f64,
 }
 
@@ -159,31 +158,12 @@ pub(crate) fn pct(part: usize, total: usize) -> f64 {
     }
 }
 
-#[derive(Clone)]
-/// Canonicalize `value` through the sort's union-find table (one hop to
-/// canonical, mirroring the core extractor's `find_canonical`).
-fn canonical_value(eg: &egglog::EGraph, sort: &egglog::ArcSort, value: EggValue) -> EggValue {
-    let Some(uf_name) = eg.proof_state.uf_parent.get(sort.name()) else {
-        return value;
-    };
-    let Some(uf_func) = eg.functions.get(uf_name) else {
-        return value;
-    };
-    let mut canonical = value;
-    eg.backend
-        .for_each(uf_func.backend_id, |row: egglog_bridge::ScanEntry| {
-            if row.vals[0] == value {
-                canonical = row.vals[1];
-            }
-        });
-    canonical
-}
-
 pub(crate) struct ClassGraph {
     pub(crate) funcs: Vec<FuncTab>,
     pub(crate) enodes: Vec<Enode>,
-    pub(crate) classes: Vec<EggValue>,
-    pub(crate) class_index: HashMap<EggValue, u32>,
+    /// Canonical ClassId string per dense class index ("{sort}-{rep}").
+    pub(crate) classes: Vec<String>,
+    pub(crate) class_index: HashMap<String, u32>,
     /// Class index -> indices into `enodes`.
     pub(crate) enodes_of: Vec<Vec<usize>>,
     /// Parent class -> child classes (for Tarjan / reverse walks).
@@ -199,12 +179,19 @@ pub(crate) struct ClassGraph {
 impl ClassGraph {
     /// Build the snapshot for one eq-sort over a constructor whitelist with
     /// per-constructor head costs (costs are carried on the enodes; the cut
-    /// iterator passes zeros).
+    /// iterator passes zeros).  `roots` (values of the root sort) are
+    /// canonicalized against the SAME serialize pass and returned aligned.
+    ///
+    /// Egglog-3 port: the core privatized its internals, so the class graph
+    /// is built from the public in-core serializer (`EGraph::serialize`),
+    /// which canonicalizes classes (`get_canon_repr`) and renders primitive
+    /// leaves as nodes whose `op` is the printed value.
     pub(crate) fn build(
         eg: &egglog::EGraph,
         sort: &str,
         heads: &HashMap<String, f64>,
-    ) -> PyResult<Self> {
+        roots: &[egglog::Value],
+    ) -> PyResult<(Self, Vec<u32>)> {
         let root = eg
             .get_sort_by_name(sort)
             .ok_or_else(|| PyValueError::new_err(format!("Unknown sort {sort}")))?
@@ -213,22 +200,21 @@ impl ClassGraph {
             return Err(PyValueError::new_err(format!("Root sort {sort} is not an eq sort")));
         }
 
+        // one serialize pass: graph content + canonical root class ids
+        let out = eg.serialize(egglog::SerializeConfig {
+            max_functions: None,
+            max_calls_per_function: None,
+            include_temporary_functions: false,
+            root_eclasses: roots.iter().map(|v| (root.clone(), *v)).collect(),
+        });
+        let ser = out.egraph;
+        let root_cids: Vec<String> = ser.root_eclasses.iter().map(|c| c.to_string()).collect();
+        // ---- constructor signatures from the public function table ----
         let mut funcs: Vec<FuncTab> = Vec::new();
-        let mut enodes: Vec<Enode> = Vec::new();
-        let mut class_index: HashMap<EggValue, u32> = HashMap::default();
-        let mut classes: Vec<EggValue> = Vec::new();
-        let mut enodes_of: Vec<Vec<usize>> = Vec::new();
-
-        // Sorted whitelist: deterministic class numbering across processes.
-        let mut names: Vec<&String> = heads.keys().collect();
-        names.sort();
-        for name in names {
-            let head = &heads[name];
-            let Some(f) = eg.get_function(name) else {
-                continue; // declared but absent from this e-graph
-            };
-            if f.is_let_binding() {
-                continue; // let-globals are references, not constructors
+        let mut sigs: HashMap<String, (Vec<bool>, usize)> = HashMap::new();
+        for (name, f) in eg.functions_iter() {
+            if !heads.contains_key(name) || f.is_let_binding() {
+                continue;
             }
             let ftype = f.func_type();
             if ftype.output.name() != root.name() {
@@ -251,62 +237,118 @@ impl ClassGraph {
                     eq_mask.push(false);
                 }
             }
-            let fid = funcs.len();
+            sigs.insert(name.clone(), (eq_mask.clone(), ftype.input.len()));
             funcs.push(FuncTab {
                 term_name: name.clone(),
-                eq_mask: eq_mask.clone(),
+                eq_mask,
                 arity: ftype.input.len(),
             });
+        }
+        // deterministic ctor order: sorted whitelist names
+        funcs.sort_by(|a, b| a.term_name.cmp(&b.term_name));
 
-            let arity = ftype.input.len();
-            let mut rows: Vec<(Vec<EggValue>, EggValue)> = Vec::new();
-            eg.backend
-                .for_each(f.backend_id, |row: egglog_bridge::ScanEntry| {
-                    if !row.subsumed && row.vals.len() == arity + 1 {
-                        rows.push((row.vals[..arity].to_vec(), row.vals[arity]));
-                    }
-                });
+        // ---- bucket serialized ctor nodes by op name ----
+        // NodeId format: "function-{offset}-{name}" (offset = row index).
+        let mut buckets: HashMap<String, Vec<(usize, egraph_serialize::NodeId)>> = HashMap::new();
+        for (nid, _node) in ser.nodes.iter() {
+            let id = nid.to_string();
+            if let Some(rest) = id.strip_prefix("function-")
+                && let Some(dash) = rest.find('-')
+                && let Ok(offset) = rest[..dash].parse::<usize>()
+            {
+                buckets
+                    .entry(rest[dash + 1..].to_string())
+                    .or_default()
+                    .push((offset, nid.clone()));
+            }
+        }
+        for v in buckets.values_mut() {
+            v.sort_by_key(|(off, _)| *off);
+        }
 
-            for (children, out) in rows {
+        // ---- walk whitelist ctors in order, interning classes ----
+        let mut class_index: HashMap<String, u32> = HashMap::new();
+        let mut classes: Vec<String> = Vec::new();
+        let mut enodes: Vec<Enode> = Vec::new();
+        let mut enodes_of: Vec<Vec<usize>> = Vec::new();
+        let mut intern = |cid: &str,
+                          class_index: &mut HashMap<String, u32>,
+                          classes: &mut Vec<String>,
+                          enodes_of: &mut Vec<Vec<usize>>|
+         -> u32 {
+            if let Some(&i) = class_index.get(cid) {
+                i
+            } else {
+                let i = classes.len() as u32;
+                classes.push(cid.to_string());
+                class_index.insert(cid.to_string(), i);
+                enodes_of.push(Vec::new());
+                i
+            }
+        };
+        let mut root_ids: Vec<u32> = Vec::with_capacity(roots.len());
+        for cs in &root_cids {
+            root_ids.push(intern(
+                &cs,
+                &mut class_index,
+                &mut classes,
+                &mut enodes_of,
+            ));
+        }
+
+        for f in &funcs {
+            let Some(rows) = buckets.get(&f.term_name) else {
+                continue;
+            };
+            let head = heads[&f.term_name];
+            for (_off, nid) in rows {
+                let node = &ser.nodes[nid];
+                if node.subsumed {
+                    continue;
+                }
+                let out_i = intern(
+                    &node.eclass.to_string(),
+                    &mut class_index,
+                    &mut classes,
+                    &mut enodes_of,
+                );
                 let mut ch_eq = Vec::new();
                 let mut ch_prim = Vec::new();
-                for (pos, (is_eq, v)) in eq_mask.iter().zip(children.iter()).enumerate() {
-                    if *is_eq {
-                        let cv = canonical_value(eg, &root, *v);
-                        let i = class_index.get(&cv).copied().unwrap_or_else(|| {
-                            let i = classes.len() as u32;
-                            classes.push(cv);
-                            class_index.insert(cv, i);
-                            enodes_of.push(Vec::new());
-                            i
-                        });
-                        ch_eq.push(i);
+                for (pos, child) in node.children.iter().enumerate() {
+                    let cs = child.to_string();
+                    if cs.starts_with("primitive-") {
+                        // primitive leaf: op is the printed value
+                        let val = ser.nodes.get(child).map(|n| n.op.clone()).unwrap_or_default();
+                        let val = val.trim_matches('"').to_string();
+                        ch_prim.push((pos as u32, val));
                     } else {
-                        ch_prim.push((pos as u32, *v));
+                        let ccs = ser
+                            .nodes
+                            .get(child)
+                            .map(|n| n.eclass.to_string())
+                            .unwrap_or_else(|| cs);
+                        let ci = intern(
+                            &ccs,
+                            &mut class_index,
+                            &mut classes,
+                            &mut enodes_of,
+                        );
+                        ch_eq.push(ci);
                     }
                 }
-                let out_c = canonical_value(eg, &root, out);
-                let oi = class_index.get(&out_c).copied().unwrap_or_else(|| {
-                    let i = classes.len() as u32;
-                    classes.push(out_c);
-                    class_index.insert(out_c, i);
-                    enodes_of.push(Vec::new());
-                    i
-                });
                 let e = Enode {
-                    func: fid,
-                    out: oi,
+                    func: funcs.iter().position(|x| x.term_name == f.term_name).unwrap(),
+                    out: out_i,
                     ch_eq,
                     ch_prim,
-                    head: *head,
+                    head,
                 };
-                enodes_of[oi as usize].push(enodes.len());
+                enodes_of[out_i as usize].push(enodes.len());
                 enodes.push(e);
             }
         }
 
         let n = classes.len();
-        // adjacency: parent class -> child classes (for Tarjan)
         let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
         for e in &enodes {
             for &c in &e.ch_eq {
@@ -321,16 +363,19 @@ impl ClassGraph {
             }
         }
 
-        Ok(ClassGraph {
-            funcs,
-            enodes,
-            classes,
-            class_index,
-            enodes_of,
-            adj,
-            sccs,
-            scc_of,
-        })
+        Ok((
+            ClassGraph {
+                funcs,
+                enodes,
+                classes,
+                class_index,
+                enodes_of,
+                adj,
+                sccs,
+                scc_of,
+            },
+            root_ids,
+        ))
     }
 
     /// Forward closure over children from `root` classes (the PO cone: all

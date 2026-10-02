@@ -315,7 +315,10 @@ def test_stats_fields():
     assert st["elapsed_ms"] >= 0
 
 
-def test_root_not_in_graph_raises():
+def test_root_outside_whitelist_degrades_to_trivial():
+    """A root whose constructor is not whitelisted canonicalizes to a class
+    with no enumerable e-nodes -> trivial-only cut (the LOUD unmappable-PO
+    error lives in CutMapper, see its tests)."""
     egraph = EGraph()
     x, y = Bool.var("x"), Bool.var("y")
     e = x.mux(y, x)  # mux not whitelisted below
@@ -323,10 +326,11 @@ def test_root_not_in_graph_raises():
     op_map = _op_map(egraph)
     op_map = {k: v for k, v in op_map.items() if v != "mux"}
     sort = _sort_egg_name(egraph, e)
-    with pytest.raises(ValueError, match="root value not present"):
-        bindings.CutIterator(
-            egraph._state.egraph, sort, op_map, [_value(egraph, e)], 4, 16
-        )
+    it = bindings.CutIterator(
+        egraph._state.egraph, sort, op_map, [_value(egraph, e)], 4, 16
+    )
+    cuts = it.cuts_of(egraph._state.egraph, _value(egraph, e), sort)
+    assert len(cuts) == 1 and cuts[0]["enode"] is None
 
 
 def test_cutmapper_delay_first_bookkeeping():

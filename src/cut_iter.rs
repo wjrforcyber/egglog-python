@@ -639,6 +639,8 @@ pub struct CutIterator {
     pub(crate) result: CutResult,
     pub(crate) cone: Vec<bool>,
     pub(crate) root_ids: Vec<u32>,
+    /// Pre-resolved roots: value -> class index (fast lookups).
+    roots_map: HashMap<egglog::Value, u32>,
     pub(crate) pi_names: HashMap<u32, String>,
     var_func: Option<usize>,
     const_funcs: HashMap<u64, usize>,
@@ -674,7 +676,13 @@ impl CutIterator {
         }
         let eg = &egraph.egraph;
         let heads: HashMap<String, f64> = op_map.keys().map(|n| (n.clone(), 0.0)).collect();
-        let graph = ClassGraph::build(eg, &sort, &heads)?;
+        let root_values: Vec<egglog::Value> = roots.iter().map(|v| v.0).collect();
+        let (graph, root_ids) = ClassGraph::build(eg, &sort, &heads, &root_values)?;
+        let roots_map: HashMap<egglog::Value, u32> = roots
+            .iter()
+            .zip(root_ids.iter())
+            .map(|(v, &c)| (v.0, c))
+            .collect();
         let kernels = build_kernels(&graph, &op_map)?;
 
         let mut var_func = None;
@@ -693,29 +701,13 @@ impl CutIterator {
         let mut pi_names: HashMap<u32, String> = HashMap::new();
         for e in &graph.enodes {
             if kernels[e.func] == Kernel::Leaf {
-                if let Some(&(_, pv)) = e.ch_prim.first() {
-                    let name: String = eg.value_to_base::<egglog::sort::S>(pv).0;
-                    pi_names.insert(e.out, name);
+                if let Some((_, name)) = e.ch_prim.first() {
+                    pi_names.insert(e.out, name.clone());
                 }
             }
         }
 
-        // PO cone filter
-        let root_sort = eg
-            .get_sort_by_name(&sort)
-            .ok_or_else(|| PyValueError::new_err(format!("Unknown sort {sort}")))?;
-        let root_ids: Vec<u32> = roots
-            .iter()
-            .map(|v| {
-                let canonical = eg.get_canonical_value(v.0, root_sort);
-                graph.class_index.get(&canonical).copied().ok_or_else(|| {
-                    PyValueError::new_err(
-                        "root value not present in the whitelisted class graph \
-                         (is its constructor in op_map?)",
-                    )
-                })
-            })
-            .collect::<PyResult<Vec<u32>>>()?;
+        // PO cone filter (root ids canonicalized during build)
         let cone = if root_ids.is_empty() {
             vec![true; graph.classes.len()]
         } else {
@@ -736,6 +728,7 @@ impl CutIterator {
             result,
             cone,
             root_ids,
+            roots_map,
             pi_names,
             var_func,
             const_funcs,
@@ -895,11 +888,9 @@ impl CutIterator {
                                     };
                                     to_enter.push((c, cci as usize));
                                 } else {
-                                    let Some(&(_, pv)) = prim_iter.next() else {
+                                    let Some((_, s)) = prim_iter.next().cloned() else {
                                         return Err(PyValueError::new_err("corrupt enode"));
                                     };
-                                    let s: String =
-                                        egraph.egraph.value_to_base::<egglog::sort::S>(pv).0;
                                     slots[pos] = Some(termdag.0.lit(Literal::String(s)));
                                 }
                             }
@@ -1027,12 +1018,33 @@ impl CutIterator {
 }
 
 impl CutIterator {
-    pub(crate) fn class_of_impl(&self, eg: &egglog::EGraph, value: Value, sort: &str) -> PyResult<u32> {
+    pub(crate) fn class_of_impl(
+        &self,
+        eg: &egglog::EGraph,
+        value: Value,
+        sort: &str,
+    ) -> PyResult<u32> {
+        if let Some(&c) = self.roots_map.get(&value.0) {
+            return Ok(c);
+        }
         let root = eg
             .get_sort_by_name(sort)
             .ok_or_else(|| PyValueError::new_err(format!("Unknown sort {sort}")))?;
-        let canonical = eg.get_canonical_value(value.0, root);
-        self.graph.class_index.get(&canonical).copied().ok_or_else(|| {
+        let config = egglog::SerializeConfig {
+            max_functions: None,
+            max_calls_per_function: None,
+            include_temporary_functions: false,
+            root_eclasses: vec![(root.clone(), value.0)],
+        };
+        let cid = eg
+            .serialize(config)
+            .egraph
+            .root_eclasses
+            .into_iter()
+            .next()
+            .map(|c| c.to_string())
+            .ok_or_else(|| PyValueError::new_err("Unextractable root"))?;
+        self.graph.class_index.get(&cid).copied().ok_or_else(|| {
             PyValueError::new_err("Unextractable root: value not in the whitelisted class graph")
         })
     }
@@ -1091,7 +1103,13 @@ pub(crate) mod fixtures {
                 head: 0.0,
             });
         }
-        g.classes = (0..n_classes as u32).map(EggValue::new_const).collect();
+        g.classes = (0..n_classes).map(|i| format!("T-{i}")).collect();
+        g.class_index = g
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i as u32))
+            .collect();
         g.enodes_of = ens_of;
         g.adj = vec![Vec::new(); n_classes];
         for e in &g.enodes {
@@ -1144,7 +1162,7 @@ mod tests {
             func: 0,
             out: 0,
             ch_eq: vec![],
-            ch_prim: vec![(0, EggValue::new_const(7))],
+            ch_prim: vec![(0, "n7".to_string())],
             head: 0.0,
         });
         g.enodes_of[0].push(0);
@@ -1399,7 +1417,7 @@ mod tests {
             func: 0,
             out: 0,
             ch_eq: vec![],
-            ch_prim: vec![(0, EggValue::new_const(7))],
+            ch_prim: vec![(0, "n7".to_string())],
             head: 0.0,
         });
         g.enodes_of[0].push(g.enodes.len() - 1);
