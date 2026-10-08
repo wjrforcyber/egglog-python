@@ -56,7 +56,8 @@ fn var_mask(i: usize, n: usize) -> u64 {
 }
 
 fn full(n: usize) -> u64 {
-    if n >= 64 {
+    // arity 6 already fills the u64 truth table (2^6 = 64 minterms)
+    if n >= 6 {
         u64::MAX
     } else {
         (1u64 << (1u64 << n)) - 1

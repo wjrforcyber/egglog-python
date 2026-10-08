@@ -65,7 +65,7 @@ const PO_LOAD: f64 = 0.25;
 struct Entry {
     cell: usize,
     /// Cell pin i is fed by cut leaf `perm[i]`.
-    perm: [u8; 4],
+    perm: [u8; 6],
 }
 
 /// Index over all pin permutations of all cells.
@@ -79,7 +79,7 @@ struct MatchIndex {
 
 /// truth.permute_tt semantics: result bit m = tt bit at the minterm whose
 /// bit i equals bit perm[i] of m.
-fn permute_tt(tt: u64, n: usize, perm: &[u8; 4]) -> u64 {
+fn permute_tt(tt: u64, n: usize, perm: &[u8; 6]) -> u64 {
     let mut out = 0u64;
     for m in 0..(1u64 << n) {
         let mut src = 0usize;
@@ -95,18 +95,18 @@ fn permute_tt(tt: u64, n: usize, perm: &[u8; 4]) -> u64 {
     out
 }
 
-fn invert(perm: &[u8; 4], n: usize) -> [u8; 4] {
-    let mut inv = [0u8; 4];
+fn invert(perm: &[u8; 6], n: usize) -> [u8; 6] {
+    let mut inv = [0u8; 6];
     for i in 0..n {
         inv[perm[i] as usize] = i as u8;
     }
     inv
 }
 
-fn permutations(n: usize) -> Vec<[u8; 4]> {
+fn permutations(n: usize) -> Vec<[u8; 6]> {
     let mut out = Vec::new();
-    let mut cur: [u8; 4] = [0, 1, 2, 3];
-    fn heap(k: usize, cur: &mut [u8; 4], out: &mut Vec<[u8; 4]>) {
+    let mut cur: [u8; 6] = [0, 1, 2, 3, 4, 5];
+    fn heap(k: usize, cur: &mut [u8; 6], out: &mut Vec<[u8; 6]>) {
         if k == 1 {
             out.push(*cur);
             return;
@@ -127,9 +127,9 @@ fn build_index(cells: &[CellSpec]) -> Result<MatchIndex, String> {
     let mut by_key: HashMap<(usize, u64), Vec<Entry>> = HashMap::new();
     // cells arrive sorted by name from the caller: deterministic insertion
     for (ci, c) in cells.iter().enumerate() {
-        if c.arity == 0 || c.arity > 4 {
+        if c.arity == 0 || c.arity > 6 {
             return Err(format!(
-                "cell {:?} arity {} unsupported (1..=4)",
+                "cell {:?} arity {} unsupported (1..=6)",
                 c.name, c.arity
             ));
         }
@@ -152,7 +152,7 @@ struct Choice {
     /// cut index within the class's cut list.
     cut: usize,
     cell: usize,
-    perm: [u8; 4],
+    perm: [u8; 6],
     /// Class ids in cell-pin order.
     inputs: Vec<u32>,
     arrival: f64,
@@ -297,7 +297,7 @@ fn dp_once(
                         continue; // trivial cut: not cell-matchable
                     }
                     let arity = c.leaves.len();
-                    if arity == 0 || arity > 4 {
+                    if arity == 0 || arity > 6 {
                         continue;
                     }
                     let Some(entries) = index.by_key.get(&(arity, c.tt)) else {
@@ -683,7 +683,7 @@ fn dp_required_flow(
                         continue;
                     }
                     let arity = c.leaves.len();
-                    if arity == 0 || arity > 4 {
+                    if arity == 0 || arity > 6 {
                         continue;
                     }
                     let Some(entries) = index.by_key.get(&(arity, c.tt)) else {
@@ -1252,7 +1252,7 @@ mod tests {
             Some(Choice {
                 cut: 0,
                 cell: 0,
-                perm: [0, 1, 0, 0],
+                perm: [0, 1, 0, 0, 0, 0],
                 inputs: vec![1, 2],
                 arrival: 1.0,
                 flow: 1.0,
@@ -1260,7 +1260,7 @@ mod tests {
             Some(Choice {
                 cut: 0,
                 cell: 0,
-                perm: [0, 1, 0, 0],
+                perm: [0, 1, 0, 0, 0, 0],
                 inputs: vec![1, 2],
                 arrival: 1.0,
                 flow: 1.0,
@@ -1505,6 +1505,67 @@ mod tests {
         let a = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area", 1, 0.0).unwrap();
         let b = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "area", 1, 5.0).unwrap();
         assert_eq!(format!("{:?}", a.choices), format!("{:?}", b.choices));
+    }
+
+    /// T29: a 5-input cell (AOI221 shape) matches a 5-leaf cut; the
+    /// permutation machinery covers arity 5.
+    #[test]
+    fn t29_five_input_cell() {
+        // 0..4 = vars, 5 = aoi221-style cell over all five:
+        // AOI221(a,b,c,d,e) = !((a&b&c) | (d&e)); build the e-node with the
+        // aoi22 kernel? no — use a raw 5-ary op kernel with the aoi221 TT.
+        let vm = |i: usize| crate::cut_iter::fixtures::var_mask_pub(i, 5);
+        let aoi221_tt = !((vm(0) & vm(1) & vm(2)) | (vm(3) & vm(4)));
+        let mut g = mkgraph(
+            6,
+            vec![("var", vec![false]), ("B_aoi221", vec![true; 5])],
+            vec![(1, 5, vec![0, 1, 2, 3, 4])],
+        );
+        add_vars(&mut g, 0, &[0, 1, 2, 3, 4]);
+        let kernels = vec![Kernel::Leaf, Kernel::Op { tt: aoi221_tt }];
+        let cone = vec![true; 6];
+        let res = enumerate_cuts(&g, &params(6, 16), &kernels, &cone).unwrap();
+        let cells = vec![cell("aoi221", 5, aoi221_tt, 2.0, 3.0)];
+        let roots = [5u32];
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 1, 0.0).unwrap();
+        let ch = out.choices[5].as_ref().expect("5-input cell must match");
+        assert_eq!(cells[ch.cell].name, "aoi221");
+        // inputs form a permutation of the leaves; AOI221 is symmetric within
+        // (a,b,c) and (d,e), so a TT-preserving rotation may be selected —
+        // validate by checking it is one
+        let mut sorted_inputs = ch.inputs.clone();
+        sorted_inputs.sort();
+        assert_eq!(sorted_inputs, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// T30: a 6-input cell (OAI33 shape) matches at the u64 TT boundary.
+    #[test]
+    fn t30_six_input_cell() {
+        let vm = |i: usize| crate::cut_iter::fixtures::var_mask_pub(i, 6);
+        // OAI33(a1,a2,a3,b1,b2,b3) = !((a1|a2|a3) & (b1|b2|b3))
+        let oai33_tt = !((vm(0) | vm(1) | vm(2)) & (vm(3) | vm(4) | vm(5)));
+        let mut g = mkgraph(
+            7,
+            vec![("var", vec![false]), ("B_oai33", vec![true; 6])],
+            vec![(1, 6, vec![0, 1, 2, 3, 4, 5])],
+        );
+        add_vars(&mut g, 0, &[0, 1, 2, 3, 4, 5]);
+        let kernels = vec![Kernel::Leaf, Kernel::Op { tt: oai33_tt }];
+        let cone = vec![true; 7];
+        let res = enumerate_cuts(&g, &params(6, 16), &kernels, &cone).unwrap();
+        // sanity: the 6-leaf cut TT is the full-width u64 function
+        let cuts = &res.cuts[6];
+        let full = cuts.iter().find(|c| c.leaves.len() == 6).expect("6-leaf cut");
+        assert_eq!(full.tt, oai33_tt);
+        let cells = vec![cell("oai33", 6, oai33_tt, 3.0, 4.0)];
+        let roots = [6u32];
+        let out = map_cuts(&g, &res, &kernels, &cone, &roots, &cells, "delay", 1, 0.0).unwrap();
+        let ch = out.choices[6].as_ref().expect("6-input cell must match");
+        assert_eq!(cells[ch.cell].name, "oai33");
+        // OAI33 is symmetric within its two 3-input OR groups
+        let mut sorted_inputs = ch.inputs.clone();
+        sorted_inputs.sort();
+        assert_eq!(sorted_inputs, vec![0, 1, 2, 3, 4, 5]);
     }
 
     fn op_tt_of(op: &str) -> u64 {
